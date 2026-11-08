@@ -102,4 +102,4 @@ The test fixture is a local HTTP server that deliberately serves a soft-404 for 
 
 ## License
 
-To be decided before the public release. Until a license file lands in this repository, all rights are reserved.
+MIT — see [LICENSE](LICENSE). Use it, fork it, ship it; just keep the copyright notice. If SiteVigil saves you from shipping a site with an exposed `.env`, a star is the going rate.
