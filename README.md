@@ -23,6 +23,15 @@ Score: 75/100  Grade: C  HTTP 200
 
 SiteVigil is a small Python tool with **zero dependencies** — standard library only. It runs the checks that turn up again and again when real websites get audited, it works as a plain CLI for humans, and it speaks MCP so AI coding agents (Claude Code, Cursor, …) can run the same audit and fix what it finds.
 
+## Why not just use a free web checker?
+
+Fair question — sites like SecurityHeaders or Mozilla Observatory grade a page for free, and for a one-off look they're fine. SiteVigil exists for everything around that moment:
+
+- **It hands you the patch, not just the grade.** `--fix` generates a ready-to-commit config for your actual platform (Vercel, Netlify, Cloudflare Pages, nginx, Apache). On GitHub Pages it tells you plainly that headers are a platform limit and gives you the portable `_headers` file instead of a lecture.
+- **It lives where you work.** Terminal, CI (`--fail-under`, `--baseline`), and inside your AI agent via MCP — a web page can't fail your deploy or re-check a fix.
+- **It checks more than headers.** Exposed `.env`/`.git` (verified by content, not status codes), CORS reflection, cookie flags, mixed content, missing SRI, TRACE, TLS expiry, security.txt.
+- **It remembers.** Save a report, come back next week, and `--baseline` shows exactly what regressed and what got fixed — web checkers have no memory of your last scan.
+
 ## What it checks
 
 | Area | Checks |
@@ -64,6 +73,9 @@ sitevigil example.com --markdown       # a report you can paste into an issue
 sitevigil example.com --html > report.html   # one self-contained HTML report
 sitevigil a.com b.com c.com            # audit several sites, with a summary table
 sitevigil example.com --fail-under 80  # CI mode: exit 1 if the score is below 80
+sitevigil example.com --fix            # + a ready-to-commit header config for your platform
+sitevigil example.com --json > monday.json          # save a baseline
+sitevigil example.com --baseline monday.json        # next week: what regressed? (exit 1 on new findings)
 ```
 
 Scoring starts at 100 and loses points per finding (critical 25, high 15, medium 8, low 3), ending in a grade from A to F.
@@ -78,7 +90,7 @@ sitevigil --mcp
 
 MCP is a shared protocol, so **one server works with every MCP-compatible agent** — Claude Code, Claude Desktop, Cursor, Windsurf, VS Code, Gemini CLI — no per-agent builds. Only the config file's location changes; ready-to-paste snippets for each agent live in [examples/mcp](examples/mcp/README.md). Interoperability is not just claimed: the server is tested against the official MCP Python SDK client (initialize → tool list → a real `audit_site` call).
 
-Your agent gets one tool, `audit_site`, and can check a site before telling you it's "secure" — or audit the fix it just deployed.
+Your agent gets two tools: `audit_site` (the full scored report) and `suggest_fix` (the audit plus a ready-to-commit, platform-specific header config). It can check a site before telling you it's "secure" — or audit the fix it just deployed.
 
 ## Honest limits
 

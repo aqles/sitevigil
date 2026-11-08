@@ -22,7 +22,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse
 from urllib.request import Request, build_opener, HTTPRedirectHandler
 
-USER_AGENT = "SiteVigil/0.2 (+https://github.com/aqles/sitevigil)"
+USER_AGENT = "SiteVigil/0.3 (+https://github.com/aqles/sitevigil)"
 WEIGHTS = {"critical": 25, "high": 15, "medium": 8, "low": 3, "info": 0}
 MAX_BODY = 65536
 
@@ -56,6 +56,23 @@ def _group(headers) -> dict:
 def _first(headers: dict, name: str) -> str | None:
     values = headers.get(name.lower())
     return values[0] if values else None
+
+
+def _detect_platform(headers: dict) -> str:
+    server = _first(headers, "server") or ""
+    if _first(headers, "x-vercel-id") or server == "Vercel":
+        return "Vercel"
+    if _first(headers, "x-nf-request-id") or "netlify" in server.lower():
+        return "Netlify"
+    if server == "GitHub.com":
+        return "GitHub Pages"
+    if "cloudflare" in server.lower():
+        return "Cloudflare Pages"
+    if "nginx" in server:
+        return "nginx"
+    if "Apache" in server:
+        return "Apache"
+    return "generic"
 
 
 class _PageParser(HTMLParser):
@@ -284,8 +301,108 @@ def audit(raw_url: str, timeout: float = 10.0) -> dict:
     grade = ("A" if score >= 90 else "B" if score >= 80 else
              "C" if score >= 65 else "D" if score >= 50 else "F")
     return {"url": url, "final_url": final_url, "status": status,
-            "reachable": True, "tls": tls, "score": score, "grade": grade,
+            "reachable": True, "platform": _detect_platform(headers),
+            "tls": tls, "score": score, "grade": grade,
             "findings": findings}
+
+
+# Finding id -> the response header that resolves it, where one exists.
+HEADER_FIXES = {
+    "hsts-missing": ("Strict-Transport-Security",
+                     "max-age=31536000; includeSubDomains"),
+    "hsts-short": ("Strict-Transport-Security",
+                   "max-age=31536000; includeSubDomains"),
+    "csp-missing": ("Content-Security-Policy",
+                    "default-src 'self'; script-src 'self'; "
+                    "style-src 'self' 'unsafe-inline'; "
+                    "img-src 'self' data: https:; font-src 'self' data: https:; "
+                    "connect-src 'self' https:; frame-ancestors 'none'; "
+                    "base-uri 'self'; form-action 'self'"),
+    "nosniff-missing": ("X-Content-Type-Options", "nosniff"),
+    "clickjacking": ("X-Frame-Options", "DENY"),
+    "referrer-policy-missing": ("Referrer-Policy",
+                                "strict-origin-when-cross-origin"),
+    "permissions-policy-missing": ("Permissions-Policy",
+                                   "camera=(), microphone=(), geolocation=()"),
+}
+
+
+def needed_headers(report: dict) -> list[tuple[str, str]]:
+    out, seen = [], set()
+    for f in report.get("findings", []):
+        fix = HEADER_FIXES.get(f["id"])
+        if fix and fix[0] not in seen:
+            seen.add(fix[0])
+            out.append(fix)
+    return out
+
+
+def generate_fix(report: dict) -> dict:
+    """Turn header findings into a ready-to-commit config for the platform.
+
+    This is the step free web checkers stop short of: they grade you,
+    SiteVigil hands you the patch.
+    """
+    platform = report.get("platform", "generic")
+    headers = needed_headers(report)
+    if not headers:
+        return {"platform": platform, "filename": None,
+                "content": "", "notes": "No header fixes needed."}
+    if platform == "Vercel":
+        content = json.dumps({"headers": [{
+            "source": "/(.*)",
+            "headers": [{"key": k, "value": v} for k, v in headers]}]}, indent=2)
+        return {"platform": platform, "filename": "vercel.json",
+                "content": content,
+                "notes": "Merge this headers entry into vercel.json (or add the "
+                         "same headers in next.config.js if the project has one), "
+                         "then redeploy. Review the CSP first: tighten it to the "
+                         "origins your site actually calls."}
+    if platform in ("Netlify", "Cloudflare Pages"):
+        lines = ["/*"] + [f"  {k}: {v}" for k, v in headers]
+        return {"platform": platform, "filename": "_headers",
+                "content": "\n".join(lines) + "\n",
+                "notes": "Put _headers in your publish/output directory and redeploy. "
+                         "Review the CSP first: tighten it to the origins your site "
+                         "actually calls."}
+    if platform == "GitHub Pages":
+        lines = ["/*"] + [f"  {k}: {v}" for k, v in headers]
+        return {"platform": platform, "filename": "_headers",
+                "content": "\n".join(lines) + "\n",
+                "notes": "GitHub Pages cannot set response headers at all -- this is "
+                         "a platform limit, not a misconfiguration. The _headers file "
+                         "above applies if you move the site to Cloudflare Pages or "
+                         "Netlify, or put a Cloudflare proxy in front of Pages."}
+    if platform == "nginx":
+        lines = [f'add_header {k} "{v}" always;' for k, v in headers]
+        return {"platform": platform, "filename": "sitevigil-headers.conf",
+                "content": "\n".join(lines) + "\n",
+                "notes": "Include this inside your server {} block and reload nginx."}
+    if platform == "Apache":
+        lines = (["<IfModule mod_headers.c>"] +
+                 [f'Header set {k} "{v}"' for k, v in headers] +
+                 ["</IfModule>"])
+        return {"platform": platform, "filename": ".htaccess",
+                "content": "\n".join(lines) + "\n",
+                "notes": "Add this to .htaccess (requires mod_headers) and reload Apache."}
+    lines = [f"{k}: {v}" for k, v in headers]
+    return {"platform": platform, "filename": "headers.txt",
+            "content": "\n".join(lines) + "\n",
+            "notes": "Set these response headers in your server or framework config "
+                     "for every route, then re-run SiteVigil to confirm."}
+
+
+def compare_reports(baseline: dict, current: dict) -> dict:
+    """Diff two reports: which findings are new, which were resolved."""
+    base_ids = {f["id"] for f in baseline.get("findings", [])}
+    cur = {f["id"]: f for f in current.get("findings", [])}
+    return {
+        "new": [f for fid, f in cur.items() if fid not in base_ids],
+        "resolved": [fid for fid in base_ids if fid not in cur],
+        "score_delta": current.get("score", 0) - baseline.get("score", 0),
+        "baseline_score": baseline.get("score"),
+        "current_score": current.get("score"),
+    }
 
 
 def _tls_connect(host: str, port: int, timeout: float = 10):

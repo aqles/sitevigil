@@ -16,7 +16,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from sitevigil.audit import _PageParser, audit, to_html  # noqa: E402
+from sitevigil.audit import (  # noqa: E402
+    _PageParser, audit, compare_reports, generate_fix, to_html)
 from sitevigil.mcp_server import handle  # noqa: E402
 
 INDEX = b"<html><body>spa index</body></html>"
@@ -93,9 +94,27 @@ class AuditTest(unittest.TestCase):
         self.assertFalse(scripts["https://cdn.example/x.js"])
         self.assertTrue(scripts["https://example.com/local.js"])
 
+    def test_fix_and_compare(self):
+        report = audit(self.base)
+        fix = generate_fix(report)
+        self.assertIn("X-Content-Type-Options", fix["content"])
+        self.assertIn("Content-Security-Policy", fix["content"])
+        same = compare_reports(report, report)
+        self.assertEqual(same["new"], [])
+        self.assertEqual(same["score_delta"], 0)
+        worse = dict(report, findings=report["findings"] + [
+            {"id": "brand-new", "severity": "high", "title": "t",
+             "detail": "d", "fix": "f"}], score=report["score"] - 15)
+        diff = compare_reports(report, worse)
+        self.assertEqual([f["id"] for f in diff["new"]], ["brand-new"])
+        self.assertEqual(diff["score_delta"], -15)
+
     def test_mcp_tools(self):
-        self.assertEqual(handle({"method": "tools/list"})["tools"][0]["name"],
-                         "audit_site")
+        names = [t["name"] for t in handle({"method": "tools/list"})["tools"]]
+        self.assertEqual(names, ["audit_site", "suggest_fix"])
+        out = handle({"method": "tools/call", "params": {
+            "name": "suggest_fix", "arguments": {"url": self.base}}})
+        self.assertIn("fix", json.loads(out["content"][0]["text"]))
         out = handle({"method": "tools/call", "params": {
             "name": "audit_site", "arguments": {"url": self.base}}})
         parsed = json.loads(out["content"][0]["text"])
