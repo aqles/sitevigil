@@ -48,7 +48,7 @@ Fair question — sites like SecurityHeaders or Mozilla Observatory grade a page
 
 | Area | Checks |
 | --- | --- |
-| Transport | HTTPS in place, HTTP → HTTPS redirect, TLS protocol, certificate expiry |
+| Transport | HTTPS in place, HTTP → HTTPS redirect, TLS protocol, certificate expiry, redirect chains (downgrade hops, chains over 3 hops) |
 | Security headers | HSTS, Content-Security-Policy (incl. `unsafe-inline` / `unsafe-eval` / wildcard sources), X-Content-Type-Options, clickjacking, Referrer-Policy, Permissions-Policy |
 | Cookies | Secure, HttpOnly (on session-like cookies), SameSite |
 | CORS | Arbitrary-origin reflection, `*` combined with credentials |
@@ -92,6 +92,8 @@ sitevigil example.com --fail-under 80  # CI mode: exit 1 if the score is below 8
 sitevigil example.com --fix            # + a ready-to-commit header config for your platform
 sitevigil example.com --json > monday.json          # save a baseline
 sitevigil example.com --baseline monday.json        # next week: what regressed? (exit 1 on new findings)
+sitevigil example.com --crawl 10                    # audit up to 10 pages (sitemap.xml, else homepage links)
+sitevigil example.com --badge > badge.svg           # an SVG score badge for your README
 ```
 
 Scoring starts at 100 and loses points per finding (critical 25, high 15, medium 8, low 3), ending in a grade from A to F.

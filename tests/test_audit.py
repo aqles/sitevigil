@@ -17,10 +17,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from sitevigil.audit import (  # noqa: E402
-    CHECKS, _PageParser, audit, compare_reports, generate_fix, to_html)
+    CHECKS, _PageParser, audit, compare_reports, discover_urls,
+    generate_fix, to_badge, to_html)
 from sitevigil.mcp_server import handle  # noqa: E402
 
-INDEX = b"<html><body>spa index</body></html>"
+INDEX = b'<html><body>spa index <a href="/page2">two</a></body></html>'
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -32,7 +33,20 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, body, "message/http")
 
     def do_GET(self):
-        if self.path == "/.env":
+        hops = {"/hop1": "/hop2", "/hop2": "/hop3", "/hop3": "/hop4",
+                "/hop4": "/"}
+        if self.path in hops:
+            self.send_response(302)
+            self.send_header("Location", hops[self.path])
+            self.end_headers()
+        elif self.path == "/sitemap.xml":
+            host = self.headers.get("Host", "127.0.0.1")
+            xml = ("<?xml version='1.0'?><urlset>"
+                   f"<url><loc>http://{host}/</loc></url>"
+                   f"<url><loc>http://{host}/page2</loc></url>"
+                   f"<url><loc>http://{host}/page3</loc></url></urlset>")
+            self._send(200, xml.encode(), "application/xml")
+        elif self.path == "/.env":
             self._send(200, b"API_KEY=abc123\nDB_PASSWORD=hunter2\n", "text/plain")
         elif self.path == "/":
             self.send_response(200)
@@ -121,6 +135,21 @@ class AuditTest(unittest.TestCase):
                     else fid.split("-weak")[0] if fid.startswith("csp-weak") else fid)
             self.assertTrue(base in catalog or fid in catalog,
                             f"{fid} missing from CHECKS catalog")
+
+    def test_v05_crawl_badge_redirects(self):
+        report = audit(self.base + "/hop1")
+        ids = [f["id"] for f in report["findings"]]
+        self.assertIn("redirect-chain-long", ids)
+        self.assertEqual(len(report["redirect_chain"]), 5)
+        urls = discover_urls(self.base, limit=5)
+        self.assertTrue(any(u.endswith("/page2") for u in urls), urls)
+        self.assertTrue(any(u.endswith("/page3") for u in urls), urls)
+        self.assertLessEqual(len(urls), 5)
+        badge = to_badge(audit(self.base))
+        self.assertIn("<svg", badge)
+        self.assertIn("/100", badge)
+        fix = generate_fix(audit(self.base))
+        self.assertIn("Cross-Origin-Opener-Policy", fix["content"])
 
     def test_banner(self):
         import contextlib

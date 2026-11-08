@@ -22,7 +22,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse
 from urllib.request import Request, build_opener, HTTPRedirectHandler
 
-USER_AGENT = "SiteVigil/0.4 (+https://github.com/aqles/sitevigil)"
+USER_AGENT = "SiteVigil/0.5 (+https://github.com/aqles/sitevigil)"
 WEIGHTS = {"critical": 25, "high": 15, "medium": 8, "low": 3, "info": 0}
 MAX_BODY = 65536
 
@@ -33,6 +33,9 @@ RULESET_VERSION = "2026.11"
 CHECKS = [
     ("no-https", "critical", "Site is served over HTTPS", "https://developer.mozilla.org/en-US/docs/Web/Security/Transport_Layer_Security"),
     ("http-no-redirect", "high", "HTTP redirects to HTTPS", "https://developer.mozilla.org/en-US/docs/Web/Security/Transport_Layer_Security"),
+    ("redirect-downgrade", "high", "Redirect chain never downgrades HTTPS to HTTP", "https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Redirections"),
+    ("redirect-chain-long", "low", "Redirect chain is short (3 hops or fewer)", "https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Redirections"),
+    ("hsts-short", "low", "HSTS max-age is at least 180 days", "https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Strict-Transport-Security"),
     ("tls-expired", "critical", "TLS certificate is valid and not expiring", "https://developer.mozilla.org/en-US/docs/Web/Security/Transport_Layer_Security"),
     ("tls-expiring", "high", "TLS certificate is valid and not expiring", "https://developer.mozilla.org/en-US/docs/Web/Security/Transport_Layer_Security"),
     ("tls-untrusted", "high", "TLS certificate passes verification", "https://developer.mozilla.org/en-US/docs/Web/Security/Transport_Layer_Security"),
@@ -64,6 +67,7 @@ CHECKS = [
     ("spf-missing", "low", "SPF record present when the domain receives mail", "https://www.rfc-editor.org/rfc/rfc7208"),
     ("caa-missing", "info", "CAA record restricts certificate issuance", "https://www.rfc-editor.org/rfc/rfc8659"),
     ("server-header", "info", "Server / X-Powered-By do not disclose stack details", "https://owasp.org/www-project-web-security-testing-guide/"),
+    ("powered-by-header", "info", "Server / X-Powered-By do not disclose stack details", "https://owasp.org/www-project-web-security-testing-guide/"),
 ]
 
 
@@ -96,6 +100,115 @@ def _group(headers) -> dict:
 def _first(headers: dict, name: str) -> str | None:
     values = headers.get(name.lower())
     return values[0] if values else None
+
+
+def _redirect_chain(url: str, timeout: float, max_hops: int = 10) -> list[str]:
+    """Follow redirects manually, returning every URL visited (start first)."""
+    chain = [url]
+    current = url
+    for _ in range(max_hops):
+        try:
+            status, headers, _, _ = _fetch(current, timeout, follow=False)
+        except (URLError, socket.timeout, OSError):
+            break
+        if status not in (301, 302, 303, 307, 308):
+            break
+        location = _first(headers, "location")
+        if not location:
+            break
+        current = urljoin(current, location)
+        chain.append(current)
+    return chain
+
+
+_SKIP_EXT = re.compile(
+    r"\.(png|jpe?g|gif|svg|webp|ico|css|js|mjs|json|pdf|zip|gz|"
+    r"woff2?|ttf|mp4|mp3|webmanifest)([?#]|$)", re.I)
+
+
+class _LinkParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.links: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            href = dict(attrs).get("href")
+            if href:
+                self.links.append(href)
+
+
+def discover_urls(start_url: str, timeout: float = 10.0, limit: int = 5) -> list[str]:
+    """Find pages to crawl: sitemap.xml first, homepage links as fallback.
+
+    Same-origin HTML pages only, start URL first, capped at `limit`.
+    """
+    url = start_url if "://" in start_url else f"https://{start_url}"
+    origin = urlparse(url)
+    base = f"{origin.scheme}://{origin.netloc}"
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def push(candidate: str) -> None:
+        candidate = candidate.split("#", 1)[0]
+        p = urlparse(candidate)
+        if p.scheme not in ("http", "https") or p.netloc != origin.netloc:
+            return
+        if _SKIP_EXT.search(p.path):
+            return
+        key = candidate.rstrip("/") or candidate
+        if key not in seen:
+            seen.add(key)
+            found.append(candidate)
+
+    push(url)
+    # 1) Sitemap (one level of sitemap-index is enough in practice)
+    try:
+        _, _, sm_body, _ = _fetch(base + "/sitemap.xml", timeout)
+        locs = re.findall(r"<loc>\s*([^<]+?)\s*</loc>",
+                          sm_body.decode("utf-8", errors="ignore"))
+        if any(u.endswith(".xml") for u in locs):
+            for child in locs[:1]:
+                _, _, child_body, _ = _fetch(child, timeout)
+                locs = re.findall(r"<loc>\s*([^<]+?)\s*</loc>",
+                                  child_body.decode("utf-8", errors="ignore"))
+        for u in locs:
+            push(u)
+    except (URLError, socket.timeout, OSError):
+        pass
+    # 2) Homepage links, if the sitemap did not fill the budget
+    if len(found) < limit:
+        try:
+            _, _, body, final = _fetch(url, timeout)
+            parser = _LinkParser()
+            parser.feed(body.decode("utf-8", errors="ignore"))
+            for href in parser.links:
+                push(urljoin(final, href))
+        except (URLError, socket.timeout, OSError, Exception):
+            pass
+    return found[:limit]
+
+
+def to_badge(report: dict) -> str:
+    """A shields.io-style SVG badge with the score, for READMEs and docs."""
+    score = report.get("score", 0)
+    grade = report.get("grade", "F")
+    colour = ("#1a7f37" if score >= 90 else "#1f6feb" if score >= 80
+              else "#bf8700" if score >= 65 else "#bc4c00" if score >= 50
+              else "#cf222e")
+    label, value = "sitevigil", f"{score}/100 · grade {grade}"
+    lw = int(6.8 * len(label)) + 12
+    vw = int(6.8 * len(value)) + 12
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{lw + vw}" height="20" '
+        f'role="img" aria-label="{label}: {value}">'
+        f"<title>{label}: {value}</title>"
+        f'<rect width="{lw}" height="20" fill="#555"/>'
+        f'<rect x="{lw}" width="{vw}" height="20" fill="{colour}"/>'
+        f'<g fill="#fff" font-family="Verdana,DejaVu Sans,sans-serif" font-size="11">'
+        f'<text x="{lw / 2}" y="14" text-anchor="middle">{label}</text>'
+        f'<text x="{lw + vw / 2}" y="14" text-anchor="middle">{value}</text>'
+        f"</g></svg>")
 
 
 def _detect_platform(headers: dict) -> str:
@@ -152,6 +265,22 @@ def audit(raw_url: str, timeout: float = 10.0) -> dict:
         return {"url": url, "reachable": False, "error": str(e),
                 "score": 0, "grade": "F", "findings": []}
     is_https = urlparse(final_url).scheme == "https"
+
+    # --- Redirect chain -----------------------------------------------------
+    chain = _redirect_chain(url, timeout)
+    for a, b in zip(chain, chain[1:]):
+        if urlparse(a).scheme == "https" and urlparse(b).scheme == "http":
+            add("redirect-downgrade", "high", "Redirect chain downgrades HTTPS to HTTP",
+                f"{a} redirects to {b}; anything sent between those hops "
+                "travels unencrypted and can be tampered with.",
+                "Make every hop in the chain HTTPS; never redirect back down to HTTP.")
+            break
+    if len(chain) - 1 > 3:
+        add("redirect-chain-long", "low", "Redirect chain is long",
+            f"{len(chain) - 1} redirects: " + " -> ".join(chain[:6])
+            + (" -> ..." if len(chain) > 6 else ""),
+            "Collapse the chain to at most 1-2 hops pointing straight at the "
+            "final URL; each hop costs a round trip and can break HSTS coverage.")
 
     # --- HTTP -> HTTPS redirect -------------------------------------------
     if parsed.scheme == "https" or is_https:
@@ -373,7 +502,7 @@ def audit(raw_url: str, timeout: float = 10.0) -> dict:
              "C" if score >= 65 else "D" if score >= 50 else "F")
     return {"url": url, "final_url": final_url, "status": status,
             "reachable": True, "platform": _detect_platform(headers),
-            "ruleset": RULESET_VERSION,
+            "ruleset": RULESET_VERSION, "redirect_chain": chain,
             "tls": tls, "score": score, "grade": grade,
             "findings": findings}
 
@@ -396,6 +525,8 @@ HEADER_FIXES = {
                                 "strict-origin-when-cross-origin"),
     "permissions-policy-missing": ("Permissions-Policy",
                                    "camera=(), microphone=(), geolocation=()"),
+    "coop-missing": ("Cross-Origin-Opener-Policy", "same-origin"),
+    "corp-missing": ("Cross-Origin-Resource-Policy", "same-origin"),
 }
 
 

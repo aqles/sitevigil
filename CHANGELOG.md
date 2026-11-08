@@ -4,6 +4,18 @@ SiteVigil versions its audit ruleset separately (shown in every report
 and via `sitevigil --checks`) so results stay comparable over time and
 changes to what is checked are never silent.
 
+## 0.5.0 — ruleset 2026.11
+
+- Redirect-chain analysis on every audit: the full chain is recorded in
+  the report, an HTTPS -> HTTP downgrade hop is a high finding, and a
+  chain longer than 3 hops is flagged.
+- `--crawl N`: audit up to N pages of one site, discovered from
+  sitemap.xml (one index level) or, failing that, homepage links.
+- `--badge`: print a shields.io-style SVG score badge for READMEs.
+- `--fix` now also covers COOP and CORP findings.
+- Check catalog completed (redirect checks, hsts-short,
+  powered-by-header): 37 entries.
+
 ## 0.4.1
 
 - Banner redrawn as outline graffiti tag art (hollow stroke letters,

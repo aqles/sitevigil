@@ -1,2 +1,2 @@
 """SiteVigil -- one-command website security audit for humans and AI agents."""
-__version__ = "0.4.1"
+__version__ = "0.5.0"

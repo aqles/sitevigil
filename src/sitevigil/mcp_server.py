@@ -40,7 +40,7 @@ def handle(msg: dict) -> dict | None:
     if method == "initialize":
         return {"protocolVersion": PROTOCOL,
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "sitevigil", "version": "0.4.1"}}
+                "serverInfo": {"name": "sitevigil", "version": "0.5.0"}}
     if method == "tools/list":
         return {"tools": TOOLS}
     if method == "tools/call":

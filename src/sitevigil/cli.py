@@ -5,7 +5,8 @@ import sys
 
 from . import __version__
 from .audit import (CHECKS, RULESET_VERSION, audit, compare_reports,
-                    generate_fix, to_html, to_json, to_markdown, to_text)
+                    discover_urls, generate_fix, to_badge, to_html, to_json,
+                    to_markdown, to_text)
 
 BANNER = r"""
      .      o                 .               o                       .
@@ -43,6 +44,11 @@ def main(argv=None) -> int:
                         help="Compare against a previous --json report; exit 1 on new findings")
     parser.add_argument("--fail-under", type=int, default=None,
                         help="Exit 1 if any score is below N (for CI)")
+    parser.add_argument("--crawl", type=int, default=0, metavar="N",
+                        help="Also audit up to N pages of the site "
+                             "(from sitemap.xml or homepage links)")
+    parser.add_argument("--badge", action="store_true",
+                        help="Print an SVG score badge (for READMEs) and exit")
     args = parser.parse_args(argv)
 
     if args.checks:
@@ -58,6 +64,12 @@ def main(argv=None) -> int:
     if not args.urls:
         parser.error("at least one url is required (or use --mcp / --checks)")
 
+    if args.crawl:
+        if len(args.urls) != 1:
+            parser.error("--crawl works with exactly one url")
+        args.urls = discover_urls(args.urls[0], timeout=args.timeout,
+                                  limit=args.crawl)
+
     reports = [audit(u, timeout=args.timeout) for u in args.urls]
 
     comparison = None
@@ -70,7 +82,9 @@ def main(argv=None) -> int:
             base = base[0]
         comparison = compare_reports(base, reports[0])
 
-    if args.json:
+    if args.badge:
+        print(to_badge(reports[0]))
+    elif args.json:
         out = [dict(r) for r in reports]
         if args.fix:
             for o, r in zip(out, reports):
