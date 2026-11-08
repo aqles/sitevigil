@@ -4,6 +4,19 @@ SiteVigil versions its audit ruleset separately (shown in every report
 and via `sitevigil --checks`) so results stay comparable over time and
 changes to what is checked are never silent.
 
+## 0.8.0 — ruleset 2026.11
+
+- WordPress plugin CVE matching: Elementor, WooCommerce, Contact
+  Form 7 and Akismet versions are fingerprinted from plugin asset
+  URLs (`?ver=`), and matched against NVD. Every mapping was verified
+  live first -- including the discovery that Elementor's NVD product
+  is "website_builder"; a guessed name returns zero CVEs forever.
+  Plugins whose assets disagree on the version are skipped.
+- MCP over HTTP: `sitevigil --mcp-http PORT` serves the same tools to
+  hosted/remote agents (stateless JSON-RPC POSTs to /mcp). Localhost
+  by default; binding elsewhere prints a loud warning, because the
+  tools fetch arbitrary URLs and there is no authentication.
+
 ## 0.7.0 — ruleset 2026.11
 
 - CVE coverage grows: jQuery versions are now fingerprinted from the

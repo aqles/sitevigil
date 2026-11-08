@@ -75,10 +75,18 @@ read the structured output:
 sitevigil example.com --json
 ```
 
-## One honest limitation
+## Remote agents (HTTP transport)
 
-This server uses MCP's **stdio** transport: the agent starts SiteVigil
-as a local process. That covers the desktop/CLI agents above. Hosted
-agents that can only reach *remote* MCP servers over HTTP cannot use a
-stdio server yet — a remote (streamable HTTP) transport is on the
-roadmap, not in this version.
+For hosted agents that cannot spawn local processes, SiteVigil also
+serves MCP over HTTP:
+
+```bash
+sitevigil --mcp-http 8900            # POST JSON-RPC to http://127.0.0.1:8900/mcp
+```
+
+The HTTP transport is stateless (one JSON-RPC message per POST,
+notifications get `202`), and it binds to **localhost only** unless you
+pass `--mcp-host`. Think before you do: the tools fetch arbitrary URLs
+and there is no authentication, so a network-exposed instance is an
+unauthenticated audit service. Put it behind your own authenticated
+reverse proxy if it must leave the machine.

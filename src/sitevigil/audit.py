@@ -22,7 +22,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse
 from urllib.request import Request, build_opener, HTTPRedirectHandler
 
-USER_AGENT = "SiteVigil/0.7 (+https://github.com/aqles/sitevigil)"
+USER_AGENT = "SiteVigil/0.8 (+https://github.com/aqles/sitevigil)"
 WEIGHTS = {"critical": 25, "high": 15, "medium": 8, "low": 3, "info": 0}
 MAX_BODY = 65536
 
@@ -784,6 +784,14 @@ _CVE_PRODUCTS = {
     # Bootstrap was probed under two vendors and returned nothing, so it
     # is deliberately absent rather than silently always-zero.
     "jquery": ("jQuery", "jquery", "jquery"),
+    # WordPress plugins, keyed wp:<slug>. Every entry was verified live
+    # against NVD before being added (dictionary CPE + a real CVE match
+    # for an old version). Elementor's product is "website_builder" --
+    # guessing "elementor" silently returns zero CVEs forever.
+    "wp:elementor": ("Elementor (WordPress plugin)", "elementor", "website_builder"),
+    "wp:woocommerce": ("WooCommerce (WordPress plugin)", "woocommerce", "woocommerce"),
+    "wp:contact-form-7": ("Contact Form 7 (WordPress plugin)", "rocklobster", "contact_form_7"),
+    "wp:akismet": ("Akismet (WordPress plugin)", "automattic", "akismet"),
 }
 
 
@@ -830,6 +838,20 @@ def _fingerprints(headers: dict, body_text: str) -> list[dict]:
             if m and "jquery" not in found:
                 found["jquery"] = (m.group(1), "page source")
                 break
+        # WordPress plugins: version comes from the ?ver= that WordPress
+        # appends to each plugin's own asset URLs. If a plugin's assets
+        # disagree about the version, the fingerprint is ambiguous and
+        # the plugin is skipped -- no version, no claim.
+        plugin_versions: dict[str, set[str]] = {}
+        for slug, ver in re.findall(
+                r"/wp-content/plugins/([a-z0-9\-_]+)/[^\"'\s<>]*?[?&]ver=([\d.]+)",
+                body_text, re.I):
+            plugin_versions.setdefault(slug.lower(), set()).add(ver)
+        for slug, versions in plugin_versions.items():
+            key = f"wp:{slug}"
+            if key in _CVE_PRODUCTS and len(versions) == 1 and key not in found:
+                found[key] = (next(iter(versions)),
+                              "page source (WordPress plugin asset)")
     return [{"product": key, "name": _CVE_PRODUCTS[key][0],
              "version": version, "via": source}
             for key, (version, source) in found.items()]

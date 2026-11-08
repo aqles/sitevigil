@@ -23,6 +23,10 @@ from sitevigil.mcp_server import handle  # noqa: E402
 
 INDEX = (b'<html><body>spa index <a href="/page2">two</a>'
          b'<script src="/assets/jquery-1.12.4.min.js"></script>'
+         b'<link rel="stylesheet" href="/wp-content/plugins/woocommerce/'
+         b'assets/css/woocommerce.css?ver=5.4.0">'
+         b'<script src="/wp-content/plugins/elementor/assets/js/'
+         b'frontend.min.js?ver=3.5.5"></script>'
          b'</body></html>')
 
 
@@ -79,6 +83,18 @@ def _canned_nvd(vendor, product, version):
             "metrics": {"cvssMetricV31": [{"cvssData": {"baseScore": cvss}}]},
             "configurations": [{"nodes": [{"cpeMatch": [match]}]}]}}
 
+    if (vendor, product) == ("woocommerce", "woocommerce"):
+        return {"vulnerabilities": [
+            entry("CVE-2021-32790", 9.8, {
+                "vulnerable": True,
+                "criteria": "cpe:2.3:a:woocommerce:woocommerce:*:*:*:*:*:wordpress:*:*",
+                "versionEndExcluding": "5.5.0"})]}
+    if (vendor, product) == ("elementor", "website_builder"):
+        return {"vulnerabilities": [
+            entry("CVE-2022-29455", 5.4, {
+                "vulnerable": True,
+                "criteria": "cpe:2.3:a:elementor:website_builder:*:*:*:*:*:wordpress:*:*",
+                "versionEndIncluding": "3.5.5"})]}
     if (vendor, product) == ("jquery", "jquery"):
         return {"vulnerabilities": [
             entry("CVE-2020-11023", 6.1, {
@@ -232,6 +248,38 @@ class AuditTest(unittest.TestCase):
             self.assertEqual(main([self.base, "--json", "--output", str(out)]), 0)
             saved = json.loads(out.read_text())
             self.assertIn("score", saved)
+
+    def test_v08_wp_plugins_and_mcp_http(self):
+        report = audit(self.base)
+        sw = {s["product"]: s["version"] for s in report["software"]}
+        self.assertEqual(sw.get("wp:woocommerce"), "5.4.0", sw)
+        self.assertEqual(sw.get("wp:elementor"), "3.5.5", sw)
+        ids = [f["id"] for f in report["findings"]]
+        self.assertIn("cve-2021-32790", ids)
+        self.assertIn("cve-2022-29455", ids)
+
+        import threading
+        from urllib.request import Request, urlopen
+
+        from sitevigil.mcp_server import _make_http_server
+        server = _make_http_server("127.0.0.1", 0)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        url = f"http://127.0.0.1:{server.server_port}/mcp"
+        try:
+            req = Request(url, data=json.dumps({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/list"}).encode(),
+                headers={"Content-Type": "application/json"})
+            with urlopen(req, timeout=10) as resp:
+                payload = json.loads(resp.read())
+            names = [t["name"] for t in payload["result"]["tools"]]
+            self.assertEqual(names, ["audit_site", "suggest_fix"])
+            req = Request(url, data=json.dumps({
+                "jsonrpc": "2.0", "method": "notifications/initialized"}).encode(),
+                headers={"Content-Type": "application/json"})
+            with urlopen(req, timeout=10) as resp:
+                self.assertEqual(resp.status, 202)  # notification: no reply
+        finally:
+            server.shutdown()
 
     def test_banner(self):
         import contextlib

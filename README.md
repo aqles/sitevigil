@@ -57,7 +57,7 @@ Fair question — sites like SecurityHeaders or Mozilla Observatory grade a page
 | Methods & discovery | HTTP TRACE enabled, missing `/.well-known/security.txt` |
 | Isolation | Cross-Origin-Opener-Policy, Cross-Origin-Resource-Policy, CSP hardening directives (object-src / base-uri) |
 | Domain (via DNS) | SPF and DMARC (only when the domain receives mail), CAA |
-| Known vulnerabilities | Software/version fingerprints (nginx, Apache, PHP, OpenSSL, IIS, WordPress, Drupal, Joomla) matched against NVD CVEs, verified against each CVE's vulnerable version ranges — plus jQuery fingerprinted from the page source |
+| Known vulnerabilities | Software/version fingerprints (nginx, Apache, PHP, OpenSSL, IIS, WordPress, Drupal, Joomla) matched against NVD CVEs, verified against each CVE's vulnerable version ranges — plus jQuery and WordPress plugins (Elementor, WooCommerce, Contact Form 7, Akismet) fingerprinted from the page source |
 | Info disclosure | `Server`, `X-Powered-By` |
 
 The full catalog — 30+ checks, each with its reference — is one command away: `sitevigil --checks`. Checks are versioned as a **ruleset** (currently `2026.11`); every report names the ruleset that produced it, and changes land in [CHANGELOG.md](CHANGELOG.md), never silently. To keep a site up to date automatically, drop in the weekly GitHub Action from [examples/github-action](examples/github-action/sitevigil-weekly.yml): it re-audits on a schedule and fails on score drops or regressions.
@@ -104,10 +104,11 @@ Scoring starts at 100 and loses points per finding (critical 25, high 15, medium
 
 ## Let your AI agent use it
 
-SiteVigil ships an MCP server (still stdlib-only — newline-delimited JSON-RPC over stdio):
+SiteVigil ships an MCP server (still stdlib-only). Local agents use stdio; hosted agents can use the HTTP transport:
 
 ```bash
-sitevigil --mcp
+sitevigil --mcp                      # stdio, for desktop/CLI agents
+sitevigil --mcp-http 8900            # HTTP on localhost, for hosted agents
 ```
 
 MCP is a shared protocol, so **one server works with every MCP-compatible agent** — Claude Code, Claude Desktop, Cursor, Windsurf, VS Code, Gemini CLI — no per-agent builds. Only the config file's location changes; ready-to-paste snippets for each agent live in [examples/mcp](examples/mcp/README.md). Interoperability is not just claimed: the server is tested against the official MCP Python SDK client (initialize → tool list → a real `audit_site` call).

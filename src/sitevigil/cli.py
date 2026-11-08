@@ -39,6 +39,11 @@ def main(argv=None) -> int:
                         help="List every check in the current ruleset and exit")
     parser.add_argument("--mcp", action="store_true",
                         help="Run as an MCP server on stdio (for Claude Code, Cursor, ...)")
+    parser.add_argument("--mcp-http", type=int, default=None, metavar="PORT",
+                        help="Run as an MCP server over HTTP on PORT "
+                             "(for hosted/remote agents)")
+    parser.add_argument("--mcp-host", default="127.0.0.1",
+                        help="Interface for --mcp-http (default: localhost only)")
     parser.add_argument("--timeout", type=float, default=10.0)
     parser.add_argument("--fix", action="store_true",
                         help="Also generate a ready-to-commit header config for the platform")
@@ -68,6 +73,15 @@ def main(argv=None) -> int:
     if args.mcp:
         from .mcp_server import serve
         serve()
+        return 0
+    if args.mcp_http:
+        from .mcp_server import serve_http
+        if args.mcp_host not in ("127.0.0.1", "localhost", "::1"):
+            print(f"warning: binding {args.mcp_host} exposes an unauthenticated "
+                  "audit service (it fetches arbitrary URLs) to the network",
+                  file=sys.stderr)
+        print(f"SiteVigil MCP server on http://{args.mcp_host}:{args.mcp_http}/mcp")
+        serve_http(args.mcp_http, host=args.mcp_host)
         return 0
     if not args.urls:
         parser.error("at least one url is required (or use --mcp / --checks)")
