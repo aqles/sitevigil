@@ -1,7 +1,9 @@
 """Command line interface: sitevigil <url> [more urls] [--json|--markdown|--html]"""
 import argparse
+import io
 import json
 import sys
+from pathlib import Path
 
 from . import __version__
 from .audit import (CHECKS, RULESET_VERSION, audit, compare_reports,
@@ -52,6 +54,9 @@ def main(argv=None) -> int:
     parser.add_argument("--no-cve", action="store_true",
                         help="Skip the known-vulnerability (CVE) lookup "
                              "against NVD (faster, fully offline)")
+    parser.add_argument("--output", metavar="FILE",
+                        help="Write the report to FILE instead of stdout "
+                             "(the banner is left out of files)")
     args = parser.parse_args(argv)
 
     if args.checks:
@@ -85,6 +90,10 @@ def main(argv=None) -> int:
         if isinstance(base, list):
             base = base[0]
         comparison = compare_reports(base, reports[0])
+
+    if args.output:
+        args.no_banner = True  # files are records; the banner is terminal dress
+        real_stdout, sys.stdout = sys.stdout, io.StringIO()
 
     if args.badge:
         print(to_badge(reports[0]))
@@ -127,6 +136,12 @@ def main(argv=None) -> int:
                 print(f"  NEW      [{f['severity']}] {f['title']}")
             for fid in comparison["resolved"]:
                 print(f"  RESOLVED {fid}")
+
+    if args.output:
+        captured = sys.stdout.getvalue()
+        sys.stdout = real_stdout
+        Path(args.output).write_text(captured, encoding="utf-8")
+        print(f"Report written to {args.output}")
 
     if any(not r.get("reachable") for r in reports):
         return 2

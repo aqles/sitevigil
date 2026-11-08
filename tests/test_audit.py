@@ -21,7 +21,9 @@ from sitevigil.audit import (  # noqa: E402
     generate_fix, to_badge, to_html)
 from sitevigil.mcp_server import handle  # noqa: E402
 
-INDEX = b'<html><body>spa index <a href="/page2">two</a></body></html>'
+INDEX = (b'<html><body>spa index <a href="/page2">two</a>'
+         b'<script src="/assets/jquery-1.12.4.min.js"></script>'
+         b'</body></html>')
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -70,15 +72,21 @@ class Handler(BaseHTTPRequestHandler):
 def _canned_nvd(vendor, product, version):
     """Stand-in for the NVD API: one real match, two traps that must be
     filtered out (a range that starts above 2.4.49, a non-vulnerable entry)."""
-    if (vendor, product) != ("apache", "http_server"):
-        return {"vulnerabilities": []}
-
     def entry(cid, cvss, match):
         return {"cve": {
             "id": cid,
             "descriptions": [{"lang": "en", "value": f"stub description for {cid}"}],
             "metrics": {"cvssMetricV31": [{"cvssData": {"baseScore": cvss}}]},
             "configurations": [{"nodes": [{"cpeMatch": [match]}]}]}}
+
+    if (vendor, product) == ("jquery", "jquery"):
+        return {"vulnerabilities": [
+            entry("CVE-2020-11023", 6.1, {
+                "vulnerable": True,
+                "criteria": "cpe:2.3:a:jquery:jquery:*:*:*:*:*:*:*:*",
+                "versionEndExcluding": "3.5.0"})]}
+    if (vendor, product) != ("apache", "http_server"):
+        return {"vulnerabilities": []}
 
     return {"vulnerabilities": [
         entry("CVE-2021-41773", 7.5, {
@@ -193,11 +201,37 @@ class AuditTest(unittest.TestCase):
         self.assertTrue(any(s["product"] == "apache" and s["version"] == "2.4.49"
                             for s in report["software"]), report["software"])
         cve = [f for f in report["findings"] if f["id"].startswith("cve-")]
-        self.assertEqual([f["id"] for f in cve], ["cve-2021-41773"], cve)
-        self.assertEqual(cve[0]["severity"], "high")  # CVSS 7.5
+        apache = [f for f in cve if "41773" in f["id"]]
+        self.assertEqual([f["id"] for f in apache], ["cve-2021-41773"], cve)
+        self.assertEqual(apache[0]["severity"], "high")  # CVSS 7.5
+        # the two canned traps (future range, non-vulnerable) must be gone
+        self.assertFalse(any("9999" in f["id"] for f in cve), cve)
         off = audit(self.base, cve=False)
         self.assertFalse(any(f["id"].startswith("cve-")
                              for f in off["findings"]))
+
+    def test_v07_jquery_preload_output(self):
+        from sitevigil.audit import _hsts_preload_ready
+        report = audit(self.base)
+        self.assertTrue(any(s["product"] == "jquery" and s["version"] == "1.12.4"
+                            for s in report["software"]), report["software"])
+        jq = [f for f in report["findings"] if f["id"] == "cve-2020-11023"]
+        self.assertEqual(len(jq), 1)
+        self.assertEqual(jq[0]["severity"], "medium")  # CVSS 6.1
+        self.assertTrue(_hsts_preload_ready(
+            "max-age=63072000; includeSubDomains"))
+        self.assertFalse(_hsts_preload_ready(
+            "max-age=63072000; includeSubDomains; preload"))
+        self.assertFalse(_hsts_preload_ready("max-age=1000; includeSubDomains"))
+        import tempfile
+        from pathlib import Path
+
+        from sitevigil.cli import main
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "report.json"
+            self.assertEqual(main([self.base, "--json", "--output", str(out)]), 0)
+            saved = json.loads(out.read_text())
+            self.assertIn("score", saved)
 
     def test_banner(self):
         import contextlib

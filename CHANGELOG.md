@@ -4,6 +4,18 @@ SiteVigil versions its audit ruleset separately (shown in every report
 and via `sitevigil --checks`) so results stay comparable over time and
 changes to what is checked are never silent.
 
+## 0.7.0 — ruleset 2026.11
+
+- CVE coverage grows: jQuery versions are now fingerprinted from the
+  page source (script URLs such as jquery-1.12.4.min.js) and matched
+  against NVD like server software. Bootstrap was probed and dropped:
+  its CPE returns nothing in NVD under either vendor name, and this
+  map only ships entries verified live.
+- New info check: an HSTS policy that meets the browser preload
+  requirements (max-age >= 1 year + includeSubDomains) but is missing
+  the preload directive is called out, with the removal warning.
+- `--output FILE` writes any report format to a file (banner-free).
+
 ## 0.6.0 — ruleset 2026.11
 
 - Known-vulnerability check: SiteVigil fingerprints software and

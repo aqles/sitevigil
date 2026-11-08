@@ -57,7 +57,7 @@ Fair question — sites like SecurityHeaders or Mozilla Observatory grade a page
 | Methods & discovery | HTTP TRACE enabled, missing `/.well-known/security.txt` |
 | Isolation | Cross-Origin-Opener-Policy, Cross-Origin-Resource-Policy, CSP hardening directives (object-src / base-uri) |
 | Domain (via DNS) | SPF and DMARC (only when the domain receives mail), CAA |
-| Known vulnerabilities | Software/version fingerprints (nginx, Apache, PHP, OpenSSL, IIS, WordPress, Drupal, Joomla) matched against NVD CVEs, verified against each CVE's vulnerable version ranges |
+| Known vulnerabilities | Software/version fingerprints (nginx, Apache, PHP, OpenSSL, IIS, WordPress, Drupal, Joomla) matched against NVD CVEs, verified against each CVE's vulnerable version ranges — plus jQuery fingerprinted from the page source |
 | Info disclosure | `Server`, `X-Powered-By` |
 
 The full catalog — 30+ checks, each with its reference — is one command away: `sitevigil --checks`. Checks are versioned as a **ruleset** (currently `2026.11`); every report names the ruleset that produced it, and changes land in [CHANGELOG.md](CHANGELOG.md), never silently. To keep a site up to date automatically, drop in the weekly GitHub Action from [examples/github-action](examples/github-action/sitevigil-weekly.yml): it re-audits on a schedule and fails on score drops or regressions.
@@ -97,6 +97,7 @@ sitevigil example.com --baseline monday.json        # next week: what regressed?
 sitevigil example.com --crawl 10                    # audit up to 10 pages (sitemap.xml, else homepage links)
 sitevigil example.com --badge > badge.svg           # an SVG score badge for your README
 sitevigil example.com --no-cve                      # skip the CVE lookup (faster, fully offline)
+sitevigil example.com --html --output report.html   # write any format straight to a file
 ```
 
 Scoring starts at 100 and loses points per finding (critical 25, high 15, medium 8, low 3), ending in a grade from A to F.

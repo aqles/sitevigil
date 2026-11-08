@@ -22,7 +22,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse
 from urllib.request import Request, build_opener, HTTPRedirectHandler
 
-USER_AGENT = "SiteVigil/0.6 (+https://github.com/aqles/sitevigil)"
+USER_AGENT = "SiteVigil/0.7 (+https://github.com/aqles/sitevigil)"
 WEIGHTS = {"critical": 25, "high": 15, "medium": 8, "low": 3, "info": 0}
 MAX_BODY = 65536
 
@@ -36,6 +36,7 @@ CHECKS = [
     ("redirect-downgrade", "high", "Redirect chain never downgrades HTTPS to HTTP", "https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Redirections"),
     ("redirect-chain-long", "low", "Redirect chain is short (3 hops or fewer)", "https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Redirections"),
     ("hsts-short", "low", "HSTS max-age is at least 180 days", "https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Strict-Transport-Security"),
+    ("hsts-preload", "info", "HSTS preload status", "https://hstspreload.org/"),
     ("tls-expired", "critical", "TLS certificate is valid and not expiring", "https://developer.mozilla.org/en-US/docs/Web/Security/Transport_Layer_Security"),
     ("tls-expiring", "high", "TLS certificate is valid and not expiring", "https://developer.mozilla.org/en-US/docs/Web/Security/Transport_Layer_Security"),
     ("tls-untrusted", "high", "TLS certificate passes verification", "https://developer.mozilla.org/en-US/docs/Web/Security/Transport_Layer_Security"),
@@ -213,6 +214,15 @@ def to_badge(report: dict) -> str:
         f"</g></svg>")
 
 
+def _hsts_preload_ready(hsts: str) -> bool:
+    """True when an HSTS value satisfies the browser preload requirements
+    (max-age >= 1 year + includeSubDomains) but lacks the preload token."""
+    low = hsts.lower()
+    m = re.search(r"max-age=(\d+)", low)
+    return bool(m and int(m.group(1)) >= 31536000
+                and "includesubdomains" in low and "preload" not in low)
+
+
 def _detect_platform(headers: dict) -> str:
     server = _first(headers, "server") or ""
     if _first(headers, "x-vercel-id") or server == "Vercel":
@@ -327,6 +337,15 @@ def audit(raw_url: str, timeout: float = 10.0, cve: bool = True) -> dict:
                 add("hsts-short", "low", "HSTS max-age is short",
                     f"HSTS max-age is {m.group(1)} seconds (under 180 days).",
                     "Raise max-age to at least 31536000 (one year).")
+            elif m and _hsts_preload_ready(hsts):
+                add("hsts-preload", "info",
+                    "HSTS meets browser preload requirements but is not preloaded",
+                    f"HSTS is '{hsts}': long max-age and includeSubDomains are "
+                    "set, but the preload directive is missing, so browsers "
+                    "still trust-on-first-use for a visitor's very first visit.",
+                    "Add '; preload' to the header and submit the domain at "
+                    "hstspreload.org. Only do this when every subdomain is "
+                    "HTTPS-ready: preload removal is slow.")
 
     csp = _first(headers, "content-security-policy")
     if not csp:
@@ -761,6 +780,10 @@ _CVE_PRODUCTS = {
     "wordpress": ("WordPress", "wordpress", "wordpress"),
     "drupal": ("Drupal", "drupal", "drupal"),
     "joomla": ("Joomla", "joomla", "joomla!"),
+    # Only products whose NVD CPE was verified live belong in this map:
+    # Bootstrap was probed under two vendors and returned nothing, so it
+    # is deliberately absent rather than silently always-zero.
+    "jquery": ("jQuery", "jquery", "jquery"),
 }
 
 
@@ -800,6 +823,13 @@ def _fingerprints(headers: dict, body_text: str) -> list[dict]:
             m = re.search(pattern, text, re.I)
             if m and key not in found:
                 found[key] = (m.group(1), source)
+    if body_text:
+        for pattern in (r"jquery[-./]v?(\d+\.\d+\.\d+)",
+                        r"jquery(?:\.min)?\.js\?ver=(\d+\.\d+\.\d+)"):
+            m = re.search(pattern, body_text, re.I)
+            if m and "jquery" not in found:
+                found["jquery"] = (m.group(1), "page source")
+                break
     return [{"product": key, "name": _CVE_PRODUCTS[key][0],
              "version": version, "via": source}
             for key, (version, source) in found.items()]
