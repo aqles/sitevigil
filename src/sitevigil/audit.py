@@ -22,9 +22,49 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse
 from urllib.request import Request, build_opener, HTTPRedirectHandler
 
-USER_AGENT = "SiteVigil/0.3 (+https://github.com/aqles/sitevigil)"
+USER_AGENT = "SiteVigil/0.4 (+https://github.com/aqles/sitevigil)"
 WEIGHTS = {"critical": 25, "high": 15, "medium": 8, "low": 3, "info": 0}
 MAX_BODY = 65536
+
+# The check catalog is versioned so a report can say which ruleset
+# produced it. Bump this (and CHANGELOG.md) whenever checks change --
+# that is what "always up to date" means in practice for this tool.
+RULESET_VERSION = "2026.11"
+CHECKS = [
+    ("no-https", "critical", "Site is served over HTTPS", "https://developer.mozilla.org/en-US/docs/Web/Security/Transport_Layer_Security"),
+    ("http-no-redirect", "high", "HTTP redirects to HTTPS", "https://developer.mozilla.org/en-US/docs/Web/Security/Transport_Layer_Security"),
+    ("tls-expired", "critical", "TLS certificate is valid and not expiring", "https://developer.mozilla.org/en-US/docs/Web/Security/Transport_Layer_Security"),
+    ("tls-expiring", "high", "TLS certificate is valid and not expiring", "https://developer.mozilla.org/en-US/docs/Web/Security/Transport_Layer_Security"),
+    ("tls-untrusted", "high", "TLS certificate passes verification", "https://developer.mozilla.org/en-US/docs/Web/Security/Transport_Layer_Security"),
+    ("tls-error", "high", "TLS handshake succeeds", "https://developer.mozilla.org/en-US/docs/Web/Security/Transport_Layer_Security"),
+    ("csp-unsafe-inline", "low", "CSP does not allow inline scripts/styles", "https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/CSP"),
+    ("csp-unsafe-eval", "low", "CSP does not allow eval()", "https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/CSP"),
+    ("csp-wildcard", "low", "CSP does not use a wildcard source", "https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/CSP"),
+    ("tls-weak-protocol", "high", "TLS 1.2 or newer (no TLS 1.0/1.1)", "https://datatracker.ietf.org/doc/html/rfc8996"),
+    ("http2-not-offered", "info", "HTTP/2 offered via ALPN", "https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/HTTP2"),
+    ("hsts-missing", "medium", "Strict-Transport-Security header", "https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Strict-Transport-Security"),
+    ("csp-missing", "medium", "Content-Security-Policy header", "https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/CSP"),
+    ("csp-hardening", "low", "CSP includes object-src and base-uri restrictions", "https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/CSP"),
+    ("nosniff-missing", "low", "X-Content-Type-Options: nosniff", "https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/X-Content-Type-Options"),
+    ("clickjacking", "medium", "Clickjacking protection (X-Frame-Options / frame-ancestors)", "https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/CSP"),
+    ("referrer-policy-missing", "low", "Referrer-Policy header", "https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Referrer-Policy"),
+    ("permissions-policy-missing", "low", "Permissions-Policy header", "https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Permissions-Policy"),
+    ("coop-missing", "low", "Cross-Origin-Opener-Policy header", "https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Cross-Origin-Opener-Policy"),
+    ("corp-missing", "info", "Cross-Origin-Resource-Policy header", "https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Cross-Origin-Resource-Policy"),
+    ("cookie-*", "medium/low", "Cookies carry Secure / HttpOnly / SameSite as appropriate", "https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Cookies"),
+    ("cors-reflect", "high", "CORS does not reflect arbitrary origins", "https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/CORS"),
+    ("mixed-content", "medium", "No HTTP subresources on HTTPS pages", "https://developer.mozilla.org/en-US/docs/Web/Security/Mixed_content"),
+    ("sri-missing", "low", "Cross-origin scripts use Subresource Integrity", "https://developer.mozilla.org/en-US/docs/Web/Security/Subresource_Integrity"),
+    ("trace-enabled", "medium", "HTTP TRACE method disabled", "https://owasp.org/www-project-web-security-testing-guide/"),
+    ("exposed/.env", "critical", "No exposed .env file", "https://owasp.org/www-project-web-security-testing-guide/"),
+    ("exposed/.git/HEAD", "critical", "No exposed .git metadata", "https://owasp.org/www-project-web-security-testing-guide/"),
+    ("security-txt-missing", "info", "security.txt published (RFC 9116)", "https://www.rfc-editor.org/rfc/rfc9116"),
+    ("dmarc-missing", "medium", "DMARC record present when the domain receives mail", "https://dmarc.org/"),
+    ("dmarc-monitor-only", "info", "DMARC policy enforces (not p=none forever)", "https://dmarc.org/"),
+    ("spf-missing", "low", "SPF record present when the domain receives mail", "https://www.rfc-editor.org/rfc/rfc7208"),
+    ("caa-missing", "info", "CAA record restricts certificate issuance", "https://www.rfc-editor.org/rfc/rfc8659"),
+    ("server-header", "info", "Server / X-Powered-By do not disclose stack details", "https://owasp.org/www-project-web-security-testing-guide/"),
+]
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -133,6 +173,15 @@ def audit(raw_url: str, timeout: float = 10.0) -> dict:
     tls: dict = {}
     if is_https:
         tls = _check_tls(host, parsed.port or 443, add)
+        if tls.get("protocol") in ("TLSv1", "TLSv1.1", "SSLv3", "SSLv2"):
+            add("tls-weak-protocol", "high", "Server negotiated a deprecated TLS version",
+                f"Negotiated {tls['protocol']}; TLS 1.0/1.1 are deprecated (RFC 8996) "
+                "and rejected by modern browsers.",
+                "Disable TLS 1.0 and 1.1; serve TLS 1.2 and 1.3 only.")
+        if tls and tls.get("alpn") != "h2":
+            add("http2-not-offered", "info", "HTTP/2 was not negotiated",
+                f"ALPN result: {tls.get('alpn') or 'none'}.",
+                "Enable HTTP/2 at the server/CDN for faster, multiplexed loads.")
 
     # --- Security headers ---------------------------------------------------
     hsts = _first(headers, "strict-transport-security")
@@ -191,6 +240,25 @@ def audit(raw_url: str, timeout: float = 10.0) -> dict:
             "Header absent; browser features (camera, mic, geolocation) are not restricted.",
             "Add a Permissions-Policy disabling features you do not use, e.g. "
             "Permissions-Policy: camera=(), microphone=(), geolocation=()")
+
+    if not _first(headers, "cross-origin-opener-policy"):
+        add("coop-missing", "low", "Missing Cross-Origin-Opener-Policy header",
+            "Header absent; a malicious page that opens this site in a popup "
+            "keeps a window reference to it (cross-origin isolation missing).",
+            "Add: Cross-Origin-Opener-Policy: same-origin")
+
+    if not _first(headers, "cross-origin-resource-policy"):
+        add("corp-missing", "info", "Missing Cross-Origin-Resource-Policy header",
+            "Header absent; other origins may embed this site's resources.",
+            "Add: Cross-Origin-Resource-Policy: same-origin (or same-site if "
+            "your subdomains must embed them).")
+
+    if csp and ("object-src" not in csp or "base-uri" not in csp):
+        missing = [d for d in ("object-src", "base-uri") if d not in csp]
+        add("csp-hardening", "low", "Content-Security-Policy misses hardening directives",
+            f"CSP does not set: {', '.join(missing)}.",
+            "Add object-src 'none' and base-uri 'self' to the policy to close "
+            "plugin-content and base-tag injection gaps.")
 
     # --- Info disclosure ------------------------------------------------------
     for name, fid in (("server", "server-header"), ("x-powered-by", "powered-by-header")):
@@ -297,11 +365,15 @@ def audit(raw_url: str, timeout: float = 10.0) -> dict:
     except (URLError, socket.timeout, OSError):
         pass
 
+    # --- Domain email / issuance records (DNS-over-HTTPS) -------------------
+    _check_domain(host, add)
+
     score = max(0, 100 - sum(WEIGHTS[f["severity"]] for f in findings))
     grade = ("A" if score >= 90 else "B" if score >= 80 else
              "C" if score >= 65 else "D" if score >= 50 else "F")
     return {"url": url, "final_url": final_url, "status": status,
             "reachable": True, "platform": _detect_platform(headers),
+            "ruleset": RULESET_VERSION,
             "tls": tls, "score": score, "grade": grade,
             "findings": findings}
 
@@ -438,6 +510,79 @@ def _tls_connect(host: str, port: int, timeout: float = 10):
     return raw
 
 
+_DNS_TYPES = {"MX": 15, "TXT": 16, "CAA": 257}
+
+
+def _doh(name: str, rtype: str, timeout: float = 5.0) -> list[str]:
+    """DNS-over-HTTPS lookup (Cloudflare), returning record data strings.
+
+    Answers are filtered to the requested record type: for a hostname
+    behind a CNAME, the resolver includes the CNAME record itself in the
+    answer, and counting it as (say) an MX record once produced false
+    'this domain receives mail' findings for plain website subdomains.
+    """
+    from urllib.request import urlopen
+
+    req = Request(
+        f"https://cloudflare-dns.com/dns-query?name={name}&type={rtype}",
+        headers={"accept": "application/dns-json", "User-Agent": USER_AGENT})
+    with urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read())
+    want = _DNS_TYPES[rtype]
+    return [str(a.get("data", "")) for a in data.get("Answer", [])
+            if a.get("type") == want]
+
+
+def _check_domain(host: str, add) -> None:
+    """Email-auth and issuance records for the site's domain.
+
+    Only fires when the domain actually receives mail (has MX records):
+    a site that sends no email is not told to invent DMARC records.
+    All lookups fail silently -- DNS being unreachable must never break
+    or falsify the web audit.
+    """
+    import ipaddress
+
+    if not host or "." not in host:
+        return
+    try:
+        ipaddress.ip_address(host)
+        return  # bare IP: no domain records to check
+    except ValueError:
+        pass
+    domain = host[4:] if host.startswith("www.") else host
+    try:
+        mx = _doh(domain, "MX")
+        if mx:
+            txt = _doh(domain, "TXT")
+            if not any(t.strip('"').lower().startswith("v=spf1") for t in txt):
+                add("spf-missing", "low", "No SPF record for a mail-receiving domain",
+                    f"{domain} has MX records but no v=spf1 TXT record.",
+                    "Publish an SPF TXT record listing the services allowed to "
+                    "send mail for your domain.")
+            dmarc = _doh(f"_dmarc.{domain}", "TXT")
+            dmarc_rec = next((t for t in dmarc if "v=dmarc1" in t.lower()), None)
+            if not dmarc_rec:
+                add("dmarc-missing", "medium", "No DMARC record for a mail-receiving domain",
+                    f"{domain} receives mail (MX present) but _dmarc.{domain} "
+                    "has no DMARC policy; anyone can spoof mail from this domain.",
+                    "Publish a DMARC TXT record at _dmarc (start with p=none to "
+                    "monitor, then move to p=reject).")
+            elif "p=none" in dmarc_rec.lower().replace(" ", ""):
+                add("dmarc-monitor-only", "info", "DMARC policy is monitor-only (p=none)",
+                    f"_dmarc.{domain} is set to p=none: spoofed mail is reported "
+                    "but still delivered.",
+                    "Once the DMARC reports look clean, step up to p=quarantine "
+                    "and then p=reject so spoofed mail is actually blocked.")
+        caa = _doh(domain, "CAA")
+        if not caa:
+            add("caa-missing", "info", "No CAA record",
+                f"{domain} has no CAA records; any CA may issue certificates for it.",
+                "Add CAA records naming only the CA(s) you actually use.")
+    except Exception:
+        pass
+
+
 def _check_tls(host: str, port: int, add) -> dict:
     info: dict = {}
     try:
@@ -445,15 +590,19 @@ def _check_tls(host: str, port: int, add) -> dict:
         # certificate when verification is on. An unverified context gets {}.
         try:
             ctx = ssl.create_default_context()
+            ctx.set_alpn_protocols(["h2", "http/1.1"])
             with _tls_connect(host, port) as sock:
                 with ctx.wrap_socket(sock, server_hostname=host) as tls_sock:
                     cert = tls_sock.getpeercert()
                     info["protocol"] = tls_sock.version()
+                    info["alpn"] = tls_sock.selected_alpn_protocol()
         except ssl.SSLCertVerificationError:
             ctx = ssl._create_unverified_context()
+            ctx.set_alpn_protocols(["h2", "http/1.1"])
             with _tls_connect(host, port) as sock:
                 with ctx.wrap_socket(sock, server_hostname=host) as tls_sock:
                     info["protocol"] = tls_sock.version()
+                    info["alpn"] = tls_sock.selected_alpn_protocol()
                     der = tls_sock.getpeercert(binary_form=True)
             cert = _decode_der(der) if der else {}
             add("tls-untrusted", "high", "TLS certificate fails verification",

@@ -1,5 +1,13 @@
 # SiteVigil
 
+```
+ ####  ###  #####  ####  #   #  ###   ####  ###  #
+#       #     #    #     #   #   #   #       #   #
+ ###    #     #    ###   #   #   #   #  ##   #   #
+    #   #     #    #      # #    #   #   #   #   #
+####   ###    #    ####    #    ###   ####  ###  ####
+```
+
 **One command. A security audit of any website — scored, explained, and with the fix written out for you.**
 
 ```bash
@@ -43,7 +51,11 @@ Fair question — sites like SecurityHeaders or Mozilla Observatory grade a page
 | Exposed files | `/.env`, `/.git/HEAD`, `/.git/config` |
 | Page content | Mixed content (HTTP subresources on an HTTPS page), cross-origin scripts without Subresource Integrity |
 | Methods & discovery | HTTP TRACE enabled, missing `/.well-known/security.txt` |
+| Isolation | Cross-Origin-Opener-Policy, Cross-Origin-Resource-Policy, CSP hardening directives (object-src / base-uri) |
+| Domain (via DNS) | SPF and DMARC (only when the domain receives mail), CAA |
 | Info disclosure | `Server`, `X-Powered-By` |
+
+The full catalog — 30+ checks, each with its reference — is one command away: `sitevigil --checks`. Checks are versioned as a **ruleset** (currently `2026.11`); every report names the ruleset that produced it, and changes land in [CHANGELOG.md](CHANGELOG.md), never silently. To keep a site up to date automatically, drop in the weekly GitHub Action from [examples/github-action](examples/github-action/sitevigil-weekly.yml): it re-audits on a schedule and fails on score drops or regressions.
 
 Every finding includes what was actually observed and a concrete fix — not just a warning label.
 

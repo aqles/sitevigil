@@ -1,0 +1,28 @@
+# Weekly self-audit: keeps your sites' security posture up to date
+# without anyone remembering to check. Copy to .github/workflows/ in
+# any repository, adjust the URL list, and GitHub runs it every Monday.
+# The run FAILS if a site drops below 80 or a new medium+ finding
+# appears versus the committed baseline.
+name: sitevigil-weekly
+on:
+  schedule:
+    - cron: "0 1 * * 1"   # Mondays 01:00 UTC
+  workflow_dispatch:
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install SiteVigil
+        run: pip install git+https://github.com/aqles/sitevigil
+      - name: Audit (score gate)
+        run: sitevigil example.com www.example.org --fail-under 80 --no-banner
+      # Optional regression gate: commit a baseline first with
+      #   sitevigil example.com --json > sitevigil-baseline.json
+      # then compare against it every week:
+      # - name: Audit (regression gate)
+      #   run: sitevigil example.com --baseline sitevigil-baseline.json

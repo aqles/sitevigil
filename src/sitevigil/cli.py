@@ -3,8 +3,17 @@ import argparse
 import json
 import sys
 
-from .audit import (audit, compare_reports, generate_fix, to_html, to_json,
-                    to_markdown, to_text)
+from . import __version__
+from .audit import (CHECKS, RULESET_VERSION, audit, compare_reports,
+                    generate_fix, to_html, to_json, to_markdown, to_text)
+
+BANNER = r"""
+ ####  ###  #####  ####  #   #  ###   ####  ###  #
+#       #     #    #     #   #   #   #       #   #
+ ###    #     #    ###   #   #   #   #  ##   #   #
+    #   #     #    #      # #    #   #   #   #   #
+####   ###    #    ####    #    ###   ####  ###  ####
+""".strip("\n")
 
 
 def main(argv=None) -> int:
@@ -17,6 +26,10 @@ def main(argv=None) -> int:
     parser.add_argument("--markdown", action="store_true", help="Output a Markdown report")
     parser.add_argument("--html", action="store_true",
                         help="Output one self-contained HTML report per site")
+    parser.add_argument("--no-banner", action="store_true",
+                        help="Hide the ASCII banner in text output")
+    parser.add_argument("--checks", action="store_true",
+                        help="List every check in the current ruleset and exit")
     parser.add_argument("--mcp", action="store_true",
                         help="Run as an MCP server on stdio (for Claude Code, Cursor, ...)")
     parser.add_argument("--timeout", type=float, default=10.0)
@@ -28,12 +41,18 @@ def main(argv=None) -> int:
                         help="Exit 1 if any score is below N (for CI)")
     args = parser.parse_args(argv)
 
+    if args.checks:
+        print(f"SiteVigil ruleset {RULESET_VERSION} — {len(CHECKS)} checks")
+        for cid, severity, title, ref in CHECKS:
+            print(f"  [{severity:9}] {cid:28} {title}")
+            print(f"  {'':11} {'':28} {ref}")
+        return 0
     if args.mcp:
         from .mcp_server import serve
         serve()
         return 0
     if not args.urls:
-        parser.error("at least one url is required (or use --mcp)")
+        parser.error("at least one url is required (or use --mcp / --checks)")
 
     reports = [audit(u, timeout=args.timeout) for u in args.urls]
 
@@ -60,6 +79,9 @@ def main(argv=None) -> int:
     elif args.markdown:
         print("\n\n---\n\n".join(to_markdown(r) for r in reports))
     else:
+        if not args.no_banner:
+            print(BANNER)
+            print(f" v{__version__} — website security audit, ruleset {RULESET_VERSION}\n")
         for r in reports:
             print(to_text(r))
             print()

@@ -17,7 +17,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from sitevigil.audit import (  # noqa: E402
-    _PageParser, audit, compare_reports, generate_fix, to_html)
+    CHECKS, _PageParser, audit, compare_reports, generate_fix, to_html)
 from sitevigil.mcp_server import handle  # noqa: E402
 
 INDEX = b"<html><body>spa index</body></html>"
@@ -108,6 +108,33 @@ class AuditTest(unittest.TestCase):
         diff = compare_reports(report, worse)
         self.assertEqual([f["id"] for f in diff["new"]], ["brand-new"])
         self.assertEqual(diff["score_delta"], -15)
+
+    def test_v04_checks_and_catalog(self):
+        report = audit(self.base)
+        ids = [f["id"] for f in report["findings"]]
+        self.assertIn("coop-missing", ids)
+        self.assertIn("corp-missing", ids)
+        self.assertEqual(report["ruleset"], "2026.11")
+        catalog = {c[0] for c in CHECKS}
+        for fid in ids:  # every emitted finding must exist in the catalog
+            base = ("cookie-*" if fid.startswith("cookie-")
+                    else fid.split("-weak")[0] if fid.startswith("csp-weak") else fid)
+            self.assertTrue(base in catalog or fid in catalog,
+                            f"{fid} missing from CHECKS catalog")
+
+    def test_banner(self):
+        import contextlib
+        import io
+
+        from sitevigil.cli import main
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            main([self.base])
+        self.assertIn("####", buf.getvalue())
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            main([self.base, "--no-banner"])
+        self.assertNotIn("SITEVIGIL", buf.getvalue().split("Score")[0])
 
     def test_mcp_tools(self):
         names = [t["name"] for t in handle({"method": "tools/list"})["tools"]]
