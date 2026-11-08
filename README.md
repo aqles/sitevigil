@@ -76,15 +76,7 @@ SiteVigil ships an MCP server (still stdlib-only — newline-delimited JSON-RPC 
 sitevigil --mcp
 ```
 
-Claude Code example:
-
-```json
-{
-  "mcpServers": {
-    "sitevigil": { "command": "sitevigil", "args": ["--mcp"] }
-  }
-}
-```
+MCP is a shared protocol, so **one server works with every MCP-compatible agent** — Claude Code, Claude Desktop, Cursor, Windsurf, VS Code, Gemini CLI — no per-agent builds. Only the config file's location changes; ready-to-paste snippets for each agent live in [examples/mcp](examples/mcp/README.md). Interoperability is not just claimed: the server is tested against the official MCP Python SDK client (initialize → tool list → a real `audit_site` call).
 
 Your agent gets one tool, `audit_site`, and can check a site before telling you it's "secure" — or audit the fix it just deployed.
 

@@ -28,7 +28,7 @@ def handle(msg: dict) -> dict | None:
     if method == "initialize":
         return {"protocolVersion": PROTOCOL,
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "sitevigil", "version": "0.2.0"}}
+                "serverInfo": {"name": "sitevigil", "version": "0.2.1"}}
     if method == "tools/list":
         return {"tools": [TOOL]}
     if method == "tools/call":
