@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from sitevigil.audit import audit  # noqa: E402
+from sitevigil.audit import _PageParser, audit, to_html  # noqa: E402
 from sitevigil.mcp_server import handle  # noqa: E402
 
 INDEX = b"<html><body>spa index</body></html>"
@@ -25,6 +25,10 @@ INDEX = b"<html><body>spa index</body></html>"
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
+
+    def do_TRACE(self):
+        body = ("\r\n".join(f"{k}: {v}" for k, v in self.headers.items())).encode()
+        self._send(200, body, "message/http")
 
     def do_GET(self):
         if self.path == "/.env":
@@ -70,6 +74,24 @@ class AuditTest(unittest.TestCase):
         self.assertFalse(any("git" in i for i in ids), ids)
         self.assertLess(report["score"], 100)
         self.assertIn(report["grade"], "ABCDF")
+
+    def test_v02_checks(self):
+        report = audit(self.base)
+        ids = [f["id"] for f in report["findings"]]
+        self.assertIn("trace-enabled", ids)          # fixture echoes TRACE
+        self.assertIn("security-txt-missing", ids)   # soft-404 page has no Contact:
+        self.assertIn("/100", to_html(report))
+
+    def test_page_parser(self):
+        p = _PageParser("https://example.com/")
+        p.feed('<img src="http://insecure.example/a.png">'
+               '<script src="https://cdn.example/x.js"></script>'
+               '<script src="/local.js" integrity="sha384-abc"></script>')
+        urls = [u for _, u, _ in p.resources]
+        self.assertIn("http://insecure.example/a.png", urls)
+        scripts = {u: i for t, u, i in p.resources if t == "script"}
+        self.assertFalse(scripts["https://cdn.example/x.js"])
+        self.assertTrue(scripts["https://example.com/local.js"])
 
     def test_mcp_tools(self):
         self.assertEqual(handle({"method": "tools/list"})["tools"][0]["name"],

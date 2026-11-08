@@ -32,6 +32,8 @@ SiteVigil is a small Python tool with **zero dependencies** — standard library
 | Cookies | Secure, HttpOnly (on session-like cookies), SameSite |
 | CORS | Arbitrary-origin reflection, `*` combined with credentials |
 | Exposed files | `/.env`, `/.git/HEAD`, `/.git/config` |
+| Page content | Mixed content (HTTP subresources on an HTTPS page), cross-origin scripts without Subresource Integrity |
+| Methods & discovery | HTTP TRACE enabled, missing `/.well-known/security.txt` |
 | Info disclosure | `Server`, `X-Powered-By` |
 
 Every finding includes what was actually observed and a concrete fix — not just a warning label.
@@ -59,6 +61,8 @@ Requires Python 3.10+. That's it — nothing else gets installed.
 sitevigil example.com                  # human-readable report
 sitevigil example.com --json           # structured output, for scripts and agents
 sitevigil example.com --markdown       # a report you can paste into an issue
+sitevigil example.com --html > report.html   # one self-contained HTML report
+sitevigil a.com b.com c.com            # audit several sites, with a summary table
 sitevigil example.com --fail-under 80  # CI mode: exit 1 if the score is below 80
 ```
 

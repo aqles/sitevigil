@@ -11,16 +11,18 @@ single-page apps often answer 200 with index.html for every path
 """
 from __future__ import annotations
 
+import html
 import json
 import re
 import socket
 import ssl
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 from urllib.request import Request, build_opener, HTTPRedirectHandler
 
-USER_AGENT = "SiteVigil/0.1 (+https://github.com/aqles/sitevigil)"
+USER_AGENT = "SiteVigil/0.2 (+https://github.com/aqles/sitevigil)"
 WEIGHTS = {"critical": 25, "high": 15, "medium": 8, "low": 3, "info": 0}
 MAX_BODY = 65536
 
@@ -31,9 +33,10 @@ class _NoRedirect(HTTPRedirectHandler):
 
 
 def _fetch(url: str, timeout: float, headers: dict | None = None,
-           follow: bool = True):
+           follow: bool = True, method: str = "GET"):
     """Return (status, headers-as-dict-of-lists, body-bytes, final_url)."""
-    req = Request(url, headers={"User-Agent": USER_AGENT, **(headers or {})})
+    req = Request(url, headers={"User-Agent": USER_AGENT, **(headers or {})},
+                  method=method)
     opener = build_opener() if follow else build_opener(_NoRedirect)
     try:
         with opener.open(req, timeout=timeout) as resp:
@@ -53,6 +56,26 @@ def _group(headers) -> dict:
 def _first(headers: dict, name: str) -> str | None:
     values = headers.get(name.lower())
     return values[0] if values else None
+
+
+class _PageParser(HTMLParser):
+    """Collect subresources: (tag, absolute_url, has_integrity)."""
+
+    def __init__(self, base: str):
+        super().__init__()
+        self.base = base
+        self.resources: list[tuple[str, str, bool]] = []
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        url = None
+        if tag in ("script", "img", "iframe", "source", "video", "audio"):
+            url = a.get("src")
+        elif tag == "link" and "stylesheet" in (a.get("rel") or ""):
+            url = a.get("href")
+        if url and not url.startswith(("data:", "blob:", "#")):
+            self.resources.append(
+                (tag, urljoin(self.base, url), bool(a.get("integrity"))))
 
 
 def audit(raw_url: str, timeout: float = 10.0) -> dict:
@@ -115,14 +138,16 @@ def audit(raw_url: str, timeout: float = 10.0) -> dict:
             "Add a CSP that fits your site, starting strict, e.g. "
             "Content-Security-Policy: default-src 'self'")
     else:
-        for token, label in (("'unsafe-inline'", "allows inline scripts/styles ('unsafe-inline')"),
-                             ("'unsafe-eval'", "allows eval() ('unsafe-eval')"),
-                             ("*", "uses a wildcard source (*)")):
+        for token, fid, label in (
+                ("'unsafe-inline'", "csp-unsafe-inline",
+                 "allows inline scripts/styles ('unsafe-inline')"),
+                ("'unsafe-eval'", "csp-unsafe-eval", "allows eval() ('unsafe-eval')"),
+                ("*", "csp-wildcard", "uses a wildcard source (*)")):
             # '*' only counts as a standalone source token -- a subdomain
             # wildcard like https://*.example.com is a deliberate choice
             hit = token in csp if token != "*" else re.search(r"(?:^|[;\s])\*(?:[;\s]|$)", csp)
             if hit:
-                add(f"csp-weak-{label[:12]}", "low", "Content-Security-Policy is permissive",
+                add(fid, "low", "Content-Security-Policy is permissive",
                     f"CSP {label}: {csp[:160]}",
                     "Tighten the policy: replace wildcards/'unsafe-inline' with specific "
                     "sources and nonces or hashes where possible.")
@@ -208,6 +233,52 @@ def audit(raw_url: str, timeout: float = 10.0) -> dict:
                     f"Block access to {path} at the server/CDN and rotate any secrets it contained.")
         except (URLError, socket.timeout, OSError):
             pass
+
+    # --- Page content: mixed content + missing SRI --------------------------
+    if is_https and body:
+        parser = _PageParser(final_url)
+        try:
+            parser.feed(body.decode("utf-8", errors="ignore"))
+        except Exception:
+            pass
+        mixed = [u for _, u, _ in parser.resources if u.startswith("http://")]
+        if mixed:
+            add("mixed-content", "medium", "Mixed content: HTTP subresources on an HTTPS page",
+                f"{len(mixed)} subresource(s) load over plain HTTP, e.g. {mixed[0][:120]}",
+                "Serve every subresource over HTTPS (or a protocol-relative URL) "
+                "so the page cannot be tampered with in transit.")
+        final_host = urlparse(final_url).hostname
+        no_sri = [u for tag, u, integ in parser.resources
+                  if tag == "script" and not integ
+                  and urlparse(u).hostname != final_host]
+        if no_sri:
+            add("sri-missing", "low", "External scripts without Subresource Integrity",
+                f"{len(no_sri)} cross-origin script(s) have no integrity attribute, "
+                f"e.g. {no_sri[0][:120]}",
+                "Add integrity=\"sha384-...\" (and crossorigin=\"anonymous\") to "
+                "third-party script tags, or self-host the scripts.")
+
+    # --- TRACE method ---------------------------------------------------------
+    try:
+        s4, _, body4, _ = _fetch(final_url, timeout, method="TRACE",
+                                 headers={"X-SiteVigil-Probe": "1"})
+        if s4 == 200 and b"x-sitevigil-probe" in body4.lower():
+            add("trace-enabled", "medium", "HTTP TRACE method is enabled",
+                "The server echoed a TRACE request back (Cross-Site Tracing risk).",
+                "Disable the TRACE method on your server or CDN.")
+    except (URLError, socket.timeout, OSError):
+        pass
+
+    # --- security.txt (presence requires a Contact: line, anti soft-404) ------
+    try:
+        s5, _, body5, _ = _fetch(base + "/.well-known/security.txt", timeout)
+        if not (s5 == 200 and b"contact:" in body5.lower()):
+            add("security-txt-missing", "info", "No security.txt",
+                "/.well-known/security.txt is absent or has no Contact: line.",
+                "Publish a security.txt (RFC 9116) so researchers can report "
+                "vulnerabilities to you instead of posting them publicly.")
+    except (URLError, socket.timeout, OSError):
+        pass
 
     score = max(0, 100 - sum(WEIGHTS[f["severity"]] for f in findings))
     grade = ("A" if score >= 90 else "B" if score >= 80 else
@@ -344,6 +415,35 @@ def to_text(report: dict) -> str:
                   f"           {f['detail']}",
                   f"           Fix: {f['fix']}"]
     return "\n".join(lines)
+
+
+def to_html(report: dict) -> str:
+    """One self-contained HTML page (inline CSS, no external assets)."""
+    if not report.get("reachable"):
+        return (f"<h1>SiteVigil</h1><p>{html.escape(report['url'])} — "
+                f"unreachable: {html.escape(str(report.get('error')))}</p>")
+    colour = ("#1a7f37" if report["score"] >= 90 else "#1f6feb" if report["score"] >= 80
+              else "#bf8700" if report["score"] >= 65 else "#bc4c00" if report["score"] >= 50
+              else "#cf222e")
+    rows = "".join(
+        f"<section><h3><span class='sev {f['severity']}'>{f['severity'].upper()}</span> "
+        f"{html.escape(f['title'])}</h3><p>{html.escape(f['detail'])}</p>"
+        f"<p><strong>Fix:</strong> {html.escape(f['fix'])}</p></section>"
+        for f in report["findings"]) or "<p>No findings. Nice work.</p>"
+    return f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<title>SiteVigil — {html.escape(report['final_url'])}</title>
+<style>body{{font-family:system-ui,sans-serif;max-width:760px;margin:2rem auto;padding:0 1rem;color:#1f2328}}
+.score{{font-size:2.2rem;font-weight:700;color:{colour}}} section{{border:1px solid #d0d7de;border-radius:8px;padding:1rem;margin:1rem 0}}
+.sev{{font-size:.75rem;padding:.15rem .5rem;border-radius:999px;background:#eaeef2}}
+.sev.critical{{background:#cf222e;color:#fff}} .sev.high{{background:#bc4c00;color:#fff}}
+.sev.medium{{background:#bf8700;color:#fff}} h3{{margin:.2rem 0}}</style></head>
+<body><h1>SiteVigil report</h1>
+<p>{html.escape(report['final_url'])}</p>
+<p class="score">{report['score']}/100 — grade {report['grade']}</p>
+{rows}
+<footer><p>Generated by SiteVigil. A high score means these basics are in place, not that a site is invulnerable.</p></footer>
+</body></html>"""
 
 
 def to_json(report: dict) -> str:
