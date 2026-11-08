@@ -57,6 +57,7 @@ Fair question — sites like SecurityHeaders or Mozilla Observatory grade a page
 | Methods & discovery | HTTP TRACE enabled, missing `/.well-known/security.txt` |
 | Isolation | Cross-Origin-Opener-Policy, Cross-Origin-Resource-Policy, CSP hardening directives (object-src / base-uri) |
 | Domain (via DNS) | SPF and DMARC (only when the domain receives mail), CAA |
+| Known vulnerabilities | Software/version fingerprints (nginx, Apache, PHP, OpenSSL, IIS, WordPress, Drupal, Joomla) matched against NVD CVEs, verified against each CVE's vulnerable version ranges |
 | Info disclosure | `Server`, `X-Powered-By` |
 
 The full catalog — 30+ checks, each with its reference — is one command away: `sitevigil --checks`. Checks are versioned as a **ruleset** (currently `2026.11`); every report names the ruleset that produced it, and changes land in [CHANGELOG.md](CHANGELOG.md), never silently. To keep a site up to date automatically, drop in the weekly GitHub Action from [examples/github-action](examples/github-action/sitevigil-weekly.yml): it re-audits on a schedule and fails on score drops or regressions.
@@ -66,6 +67,7 @@ Every finding includes what was actually observed and a concrete fix — not jus
 Two details that took real-world pain to learn:
 
 - **No soft-404 false positives.** Many sites (SPAs, some hosts) answer `200` with their homepage for *every* path. SiteVigil only reports an exposed file when the response content actually matches a real `.env` / git file — a bare `200` is never enough.
+- **CVE matches are verified, not googled.** NVD search happily returns CVEs that only *mention* your software. SiteVigil re-checks every candidate against the CVE's own vulnerable configurations and version ranges before reporting it, scores it with NVD's primary CVSS, and prints the backport caveat next to every match — a version string alone never proves a server is unpatched.
 - **Proxy-aware TLS.** If you sit behind a corporate proxy (`https_proxy`), the TLS check tunnels through it with `CONNECT` instead of dying with `WRONG_VERSION_NUMBER`.
 
 ## Install
@@ -94,6 +96,7 @@ sitevigil example.com --json > monday.json          # save a baseline
 sitevigil example.com --baseline monday.json        # next week: what regressed? (exit 1 on new findings)
 sitevigil example.com --crawl 10                    # audit up to 10 pages (sitemap.xml, else homepage links)
 sitevigil example.com --badge > badge.svg           # an SVG score badge for your README
+sitevigil example.com --no-cve                      # skip the CVE lookup (faster, fully offline)
 ```
 
 Scoring starts at 100 and loses points per finding (critical 25, high 15, medium 8, low 3), ending in a grade from A to F.

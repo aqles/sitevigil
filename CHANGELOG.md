@@ -4,6 +4,21 @@ SiteVigil versions its audit ruleset separately (shown in every report
 and via `sitevigil --checks`) so results stay comparable over time and
 changes to what is checked are never silent.
 
+## 0.6.0 — ruleset 2026.11
+
+- Known-vulnerability check: SiteVigil fingerprints software and
+  versions (Server / X-Powered-By headers, generator meta tags) for
+  nginx, Apache, PHP, OpenSSL, IIS, WordPress, Drupal and Joomla, then
+  matches them against the NVD database. Matches are verified
+  client-side against each CVE's vulnerable CPE configurations and
+  version ranges -- raw NVD search results also contain products that
+  merely mention yours, and trusting them produces confident nonsense.
+- CVE findings carry the NVD primary CVSS score (severity derives from
+  it), the NVD link, and the standard caveat: distributions backport
+  fixes without changing version strings, so verify before panicking.
+- Results are cached on disk for 24 hours (NVD's no-key rate limit is
+  5 requests per 30 seconds); `--no-cve` skips the lookup entirely.
+
 ## 0.5.0 — ruleset 2026.11
 
 - Redirect-chain analysis on every audit: the full chain is recorded in

@@ -25,6 +25,9 @@ INDEX = b'<html><body>spa index <a href="/page2">two</a></body></html>'
 
 
 class Handler(BaseHTTPRequestHandler):
+    server_version = "Apache/2.4.49"  # versioned banner -> CVE fingerprint
+    sys_version = ""
+
     def log_message(self, *a):
         pass
 
@@ -64,9 +67,42 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+def _canned_nvd(vendor, product, version):
+    """Stand-in for the NVD API: one real match, two traps that must be
+    filtered out (a range that starts above 2.4.49, a non-vulnerable entry)."""
+    if (vendor, product) != ("apache", "http_server"):
+        return {"vulnerabilities": []}
+
+    def entry(cid, cvss, match):
+        return {"cve": {
+            "id": cid,
+            "descriptions": [{"lang": "en", "value": f"stub description for {cid}"}],
+            "metrics": {"cvssMetricV31": [{"cvssData": {"baseScore": cvss}}]},
+            "configurations": [{"nodes": [{"cpeMatch": [match]}]}]}}
+
+    return {"vulnerabilities": [
+        entry("CVE-2021-41773", 7.5, {
+            "vulnerable": True,
+            "criteria": "cpe:2.3:a:apache:http_server:2.4.49:*:*:*:*:*:*:*"}),
+        entry("CVE-9999-0001", 9.8, {
+            "vulnerable": True,
+            "criteria": "cpe:2.3:a:apache:http_server:*:*:*:*:*:*:*:*",
+            "versionStartIncluding": "2.4.50"}),
+        entry("CVE-9999-0002", 9.8, {
+            "vulnerable": False,
+            "criteria": "cpe:2.3:a:apache:http_server:2.4.49:*:*:*:*:*:*:*"}),
+    ]}
+
+
 class AuditTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        import os
+        import tempfile
+
+        import sitevigil.audit as audit_module
+        os.environ["SITEVIGIL_CACHE_DIR"] = tempfile.mkdtemp()
+        audit_module._nvd_query = _canned_nvd  # tests never touch real NVD
         cls.server = HTTPServer(("127.0.0.1", 0), Handler)
         threading.Thread(target=cls.server.serve_forever, daemon=True).start()
         cls.base = f"http://127.0.0.1:{cls.server.server_port}"
@@ -132,6 +168,7 @@ class AuditTest(unittest.TestCase):
         catalog = {c[0] for c in CHECKS}
         for fid in ids:  # every emitted finding must exist in the catalog
             base = ("cookie-*" if fid.startswith("cookie-")
+                    else "cve-*" if fid.startswith("cve-") and fid != "cve-overflow"
                     else fid.split("-weak")[0] if fid.startswith("csp-weak") else fid)
             self.assertTrue(base in catalog or fid in catalog,
                             f"{fid} missing from CHECKS catalog")
@@ -150,6 +187,17 @@ class AuditTest(unittest.TestCase):
         self.assertIn("/100", badge)
         fix = generate_fix(audit(self.base))
         self.assertIn("Cross-Origin-Opener-Policy", fix["content"])
+
+    def test_v06_cve(self):
+        report = audit(self.base)
+        self.assertTrue(any(s["product"] == "apache" and s["version"] == "2.4.49"
+                            for s in report["software"]), report["software"])
+        cve = [f for f in report["findings"] if f["id"].startswith("cve-")]
+        self.assertEqual([f["id"] for f in cve], ["cve-2021-41773"], cve)
+        self.assertEqual(cve[0]["severity"], "high")  # CVSS 7.5
+        off = audit(self.base, cve=False)
+        self.assertFalse(any(f["id"].startswith("cve-")
+                             for f in off["findings"]))
 
     def test_banner(self):
         import contextlib

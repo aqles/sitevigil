@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sitevigil"
-version = "0.5.0"
+version = "0.6.0"
 description = "One-command website security audit for humans and AI agents: security headers, cookies, TLS, CORS and exposed files, scored 0-100 with a concrete fix for every finding."
 readme = "README.md"
 requires-python = ">=3.10"

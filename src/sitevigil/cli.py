@@ -49,6 +49,9 @@ def main(argv=None) -> int:
                              "(from sitemap.xml or homepage links)")
     parser.add_argument("--badge", action="store_true",
                         help="Print an SVG score badge (for READMEs) and exit")
+    parser.add_argument("--no-cve", action="store_true",
+                        help="Skip the known-vulnerability (CVE) lookup "
+                             "against NVD (faster, fully offline)")
     args = parser.parse_args(argv)
 
     if args.checks:
@@ -70,7 +73,8 @@ def main(argv=None) -> int:
         args.urls = discover_urls(args.urls[0], timeout=args.timeout,
                                   limit=args.crawl)
 
-    reports = [audit(u, timeout=args.timeout) for u in args.urls]
+    reports = [audit(u, timeout=args.timeout, cve=not args.no_cve)
+               for u in args.urls]
 
     comparison = None
     if args.baseline:

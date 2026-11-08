@@ -22,7 +22,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse
 from urllib.request import Request, build_opener, HTTPRedirectHandler
 
-USER_AGENT = "SiteVigil/0.5 (+https://github.com/aqles/sitevigil)"
+USER_AGENT = "SiteVigil/0.6 (+https://github.com/aqles/sitevigil)"
 WEIGHTS = {"critical": 25, "high": 15, "medium": 8, "low": 3, "info": 0}
 MAX_BODY = 65536
 
@@ -68,6 +68,8 @@ CHECKS = [
     ("caa-missing", "info", "CAA record restricts certificate issuance", "https://www.rfc-editor.org/rfc/rfc8659"),
     ("server-header", "info", "Server / X-Powered-By do not disclose stack details", "https://owasp.org/www-project-web-security-testing-guide/"),
     ("powered-by-header", "info", "Server / X-Powered-By do not disclose stack details", "https://owasp.org/www-project-web-security-testing-guide/"),
+    ("cve-*", "varies", "Known CVEs affecting the detected software version (NVD)", "https://nvd.nist.gov/"),
+    ("cve-overflow", "info", "Total known-CVE count when more than 10 match a version", "https://nvd.nist.gov/"),
 ]
 
 
@@ -248,7 +250,7 @@ class _PageParser(HTMLParser):
                 (tag, urljoin(self.base, url), bool(a.get("integrity"))))
 
 
-def audit(raw_url: str, timeout: float = 10.0) -> dict:
+def audit(raw_url: str, timeout: float = 10.0, cve: bool = True) -> dict:
     url = raw_url if "://" in raw_url else f"https://{raw_url}"
     parsed = urlparse(url)
     host = parsed.hostname or ""
@@ -497,12 +499,44 @@ def audit(raw_url: str, timeout: float = 10.0) -> dict:
     # --- Domain email / issuance records (DNS-over-HTTPS) -------------------
     _check_domain(host, add)
 
+    # --- Known vulnerabilities for fingerprinted software -------------------
+    body_text = body.decode("utf-8", errors="ignore") if body else ""
+    software = _fingerprints(headers, body_text)
+    if cve:
+        for fp in software:
+            hits = _cve_lookup(fp["product"], fp["version"])
+            if not hits:
+                continue
+            for hit in hits[:10]:
+                cvss = hit["cvss"]
+                severity = ("critical" if cvss is not None and cvss >= 9 else
+                            "high" if cvss is not None and cvss >= 7 else
+                            "medium" if cvss is not None and cvss >= 4 else "low")
+                add(hit["id"].lower(), severity,
+                    f"{fp['name']} {fp['version']} is affected by {hit['id']}"
+                    + (f" (CVSS {cvss})" if cvss is not None else ""),
+                    f"Detected via {fp['via']}. {hit['description']} "
+                    "Fingerprint-based match: distributions sometimes backport "
+                    "security fixes without changing the version string, so "
+                    "confirm against your package changelog.",
+                    f"Upgrade {fp['name']} to a release where {hit['id']} is "
+                    f"fixed (https://nvd.nist.gov/vuln/detail/{hit['id']}), "
+                    "or verify your distribution backported the patch.")
+            if len(hits) > 10:
+                add("cve-overflow", "info",
+                    f"{fp['name']} {fp['version']} has {len(hits)} known CVEs",
+                    f"Only the 10 highest-CVSS matches are listed above; "
+                    f"{len(hits)} CVEs in total match this version in NVD.",
+                    f"Upgrade {fp['name']} to a supported release; the long "
+                    "tail of old CVEs disappears with it.")
+
     score = max(0, 100 - sum(WEIGHTS[f["severity"]] for f in findings))
     grade = ("A" if score >= 90 else "B" if score >= 80 else
              "C" if score >= 65 else "D" if score >= 50 else "F")
     return {"url": url, "final_url": final_url, "status": status,
             "reachable": True, "platform": _detect_platform(headers),
             "ruleset": RULESET_VERSION, "redirect_chain": chain,
+            "software": software,
             "tls": tls, "score": score, "grade": grade,
             "findings": findings}
 
@@ -714,6 +748,200 @@ def _check_domain(host: str, add) -> None:
         pass
 
 
+# --- Known-vulnerability (CVE) matching -----------------------------------
+# Fingerprinted product -> (display name, NVD CPE vendor, NVD CPE product).
+# nginx CVEs live under the f5 vendor in NVD since the F5 acquisition;
+# querying the old nginx:nginx CPE silently returns nothing.
+_CVE_PRODUCTS = {
+    "nginx": ("nginx", "f5", "nginx"),
+    "apache": ("Apache HTTP Server", "apache", "http_server"),
+    "php": ("PHP", "php", "php"),
+    "openssl": ("OpenSSL", "openssl", "openssl"),
+    "iis": ("Microsoft IIS", "microsoft", "internet_information_services"),
+    "wordpress": ("WordPress", "wordpress", "wordpress"),
+    "drupal": ("Drupal", "drupal", "drupal"),
+    "joomla": ("Joomla", "joomla", "joomla!"),
+}
+
+
+def _fingerprints(headers: dict, body_text: str) -> list[dict]:
+    """Detect software + version from headers and the page's generator tag.
+
+    A version is required: without one there is nothing honest to match
+    CVEs against, so unversioned banners are simply not reported.
+    """
+    found: dict[str, tuple[str, str]] = {}
+    sources = [(_first(headers, "server") or "", "Server header"),
+               (_first(headers, "x-powered-by") or "", "X-Powered-By header")]
+    for text, source in sources:
+        for pattern, key in ((r"nginx/([\d.]+)", "nginx"),
+                             (r"Apache/([\d.]+)", "apache"),
+                             (r"Microsoft-IIS/([\d.]+)", "iis"),
+                             (r"PHP/([\d.]+)", "php"),
+                             (r"OpenSSL/([\d.]+[a-z]?)", "openssl")):
+            m = re.search(pattern, text, re.I)
+            if m and key not in found:
+                found[key] = (m.group(1), source)
+    generator = None
+    if body_text:
+        m = re.search(r'<meta[^>]+name=["\']generator["\'][^>]*content=["\']([^"\']+)',
+                      body_text, re.I) or \
+            re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]*name=["\']generator["\']',
+                      body_text, re.I)
+        if m:
+            generator = m.group(1)
+    for text, source in ((generator, "meta generator tag"),
+                         (_first(headers, "x-generator"), "X-Generator header")):
+        if not text:
+            continue
+        for pattern, key in ((r"WordPress\s+([\d.]+)", "wordpress"),
+                             (r"Drupal\s+([\d.]+)", "drupal"),
+                             (r"Joomla!?\s+([\d.]+)", "joomla")):
+            m = re.search(pattern, text, re.I)
+            if m and key not in found:
+                found[key] = (m.group(1), source)
+    return [{"product": key, "name": _CVE_PRODUCTS[key][0],
+             "version": version, "via": source}
+            for key, (version, source) in found.items()]
+
+
+def _vkey(version: str) -> list:
+    parts = []
+    for token in re.split(r"[.\-+_]", str(version).strip()):
+        m = re.match(r"(\d*)([a-zA-Z]*)", token)
+        parts.append((int(m.group(1)) if m.group(1) else 0, m.group(2)))
+    return parts
+
+
+def _vcmp(a: str, b: str) -> int:
+    ka, kb = _vkey(a), _vkey(b)
+    n = max(len(ka), len(kb))
+    ka += [(0, "")] * (n - len(ka))
+    kb += [(0, "")] * (n - len(kb))
+    return (ka > kb) - (ka < kb)
+
+
+def _cpe_match(match: dict, vendor: str, product: str, version: str) -> bool:
+    """True only for a *vulnerable* CPE entry whose range covers `version`.
+
+    NVD search results also contain CVEs that merely mention the product
+    (running-on/with entries, negated matches); trusting the raw result
+    set without this filter produces confident nonsense.
+    """
+    if not match.get("vulnerable"):
+        return False
+    parts = match.get("criteria", "").split(":")
+    if len(parts) < 6 or parts[0] != "cpe" or parts[1] != "2.3":
+        return False
+    if (parts[3].replace("\\", "").lower(),
+            parts[4].replace("\\", "").lower()) != (vendor, product):
+        return False
+    criteria_version = parts[5]
+    if criteria_version not in ("*", "-"):
+        return _vcmp(version, criteria_version) == 0
+    if "versionStartIncluding" in match and \
+            _vcmp(version, match["versionStartIncluding"]) < 0:
+        return False
+    if "versionStartExcluding" in match and \
+            _vcmp(version, match["versionStartExcluding"]) <= 0:
+        return False
+    if "versionEndIncluding" in match and \
+            _vcmp(version, match["versionEndIncluding"]) > 0:
+        return False
+    if "versionEndExcluding" in match and \
+            _vcmp(version, match["versionEndExcluding"]) >= 0:
+        return False
+    return True
+
+
+def _cve_matches(cve_obj: dict, vendor: str, product: str, version: str) -> bool:
+    def walk(nodes) -> bool:
+        for node in nodes or []:
+            if any(_cpe_match(m, vendor, product, version)
+                   for m in node.get("cpeMatch", [])):
+                return True
+            if walk(node.get("children")):
+                return True
+        return False
+
+    return any(walk(cfg.get("nodes"))
+               for cfg in cve_obj.get("configurations", []))
+
+
+_NVD_API = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+_last_nvd_call = [0.0]
+
+
+def _nvd_query(vendor: str, product: str, version: str) -> dict:
+    from urllib.parse import quote
+    from urllib.request import urlopen
+
+    match = f"cpe:2.3:a:{vendor}:{product}:{version}:*:*:*:*:*:*:*"
+    url = (f"{_NVD_API}?virtualMatchString={quote(match, safe='')}"
+           "&resultsPerPage=200")
+    req = Request(url, headers={"User-Agent": USER_AGENT})
+    with urlopen(req, timeout=20) as resp:
+        return json.loads(resp.read())
+
+
+def _cve_lookup(product_key: str, version: str) -> list[dict] | None:
+    """CVEs affecting one product version, cached on disk for 24 hours.
+
+    Returns None when NVD is unreachable (the audit then simply has no
+    CVE section -- a network failure must never fail or falsify it).
+    """
+    import os
+    import time
+
+    _, vendor, product = _CVE_PRODUCTS[product_key]
+    cache_dir = os.environ.get("SITEVIGIL_CACHE_DIR") or os.path.join(
+        os.path.expanduser("~"), ".cache", "sitevigil")
+    path = os.path.join(
+        cache_dir, "cve", f"{vendor}-{product}-{version}.json".replace("/", "_"))
+    try:
+        if os.path.exists(path) and time.time() - os.path.getmtime(path) < 86400:
+            with open(path, encoding="utf-8") as fh:
+                return json.load(fh)["cves"]
+    except Exception:
+        pass
+    # NVD without an API key allows 5 requests per 30 s; space ours out.
+    wait = 6.5 - (time.time() - _last_nvd_call[0])
+    if _last_nvd_call[0] and wait > 0:
+        time.sleep(wait)
+    _last_nvd_call[0] = time.time()
+    try:
+        data = _nvd_query(vendor, product, version)
+    except Exception:
+        return None
+    out = []
+    for item in data.get("vulnerabilities", []):
+        cve_obj = item.get("cve", {})
+        if not _cve_matches(cve_obj, vendor, product, version):
+            continue
+        metrics = cve_obj.get("metrics", {})
+        cvss = None
+        for key in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
+            entries = metrics.get(key) or []
+            chosen = next((e for e in entries if e.get("type") == "Primary"),
+                          entries[0] if entries else None)
+            if chosen:
+                cvss = (chosen.get("cvssData") or {}).get("baseScore")
+                if cvss is not None:
+                    break
+        desc = next((d["value"] for d in cve_obj.get("descriptions", [])
+                     if d.get("lang") == "en"), "")
+        out.append({"id": cve_obj.get("id"), "cvss": cvss,
+                    "description": desc[:280]})
+    out.sort(key=lambda hit: hit["cvss"] or 0, reverse=True)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"cves": out}, fh)
+    except Exception:
+        pass
+    return out
+
+
 def _check_tls(host: str, port: int, add) -> dict:
     info: dict = {}
     try:
@@ -803,8 +1031,12 @@ def to_text(report: dict) -> str:
     if not report.get("reachable"):
         return f"{report['url']} — UNREACHABLE: {report.get('error')}"
     lines = [f"{report['final_url']}",
-             f"Score: {report['score']}/100  Grade: {report['grade']}  HTTP {report['status']}",
-             ""]
+             f"Score: {report['score']}/100  Grade: {report['grade']}  HTTP {report['status']}"]
+    if report.get("software"):
+        lines.append("Software: " + ", ".join(
+            f"{s['name']} {s['version']} (via {s['via']})"
+            for s in report["software"]))
+    lines.append("")
     if not report["findings"]:
         lines.append("No findings. Nice work.")
     for f in report["findings"]:
