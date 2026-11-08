@@ -130,7 +130,7 @@ class AuditTest(unittest.TestCase):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             main([self.base])
-        self.assertIn("####", buf.getvalue())
+        self.assertIn("/ ____/", buf.getvalue())
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             main([self.base, "--no-banner"])

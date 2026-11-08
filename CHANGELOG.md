@@ -4,6 +4,11 @@ SiteVigil versions its audit ruleset separately (shown in every report
 and via `sitevigil --checks`) so results stay comparable over time and
 changes to what is checked are never silent.
 
+## 0.4.1
+
+- Banner redrawn as outline graffiti tag art (hollow stroke letters,
+  spray dots, paint drips) in the terminal and README.
+
 ## 0.4.0 — ruleset 2026.11
 
 - New checks: Cross-Origin-Opener-Policy, Cross-Origin-Resource-Policy,
