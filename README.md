@@ -14,7 +14,13 @@
 
 **One command. A security audit of any website — scored, explained, and with the fix written out for you.**
 
+[![PyPI](https://img.shields.io/pypi/v/sitevigil)](https://pypi.org/project/sitevigil/)
+[![Python](https://img.shields.io/pypi/pyversions/sitevigil)](https://pypi.org/project/sitevigil/)
+[![CI](https://github.com/aqles/sitevigil/actions/workflows/test.yml/badge.svg)](https://github.com/aqles/sitevigil/actions/workflows/test.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
 ```bash
+pip install sitevigil
 sitevigil aqles.github.io
 ```
 
