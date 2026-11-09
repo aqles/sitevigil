@@ -4,6 +4,14 @@ SiteVigil versions its audit ruleset separately (shown in every report
 and via `sitevigil --checks`) so results stay comparable over time and
 changes to what is checked are never silent.
 
+## 0.8.1 — ruleset 2026.11
+
+- Packaging fix: the 0.8.0 PyPI metadata shipped without trove
+  classifiers, so the Python-versions badge (and PyPI's own sidebar)
+  had nothing to show. 0.8.1 declares the supported Python versions
+  (3.10-3.13), license, audience and topics. No code or ruleset
+  changes.
+
 ## 0.8.0 — ruleset 2026.11
 
 - WordPress plugin CVE matching: Elementor, WooCommerce, Contact
