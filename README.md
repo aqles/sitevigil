@@ -79,7 +79,7 @@ Two details that took real-world pain to learn:
 ## Install
 
 ```bash
-pip install sitevigil        # once published to PyPI
+pip install sitevigil
 # or straight from the repo:
 pip install git+https://github.com/aqles/sitevigil
 # or just run it from a clone, no install needed:
