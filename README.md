@@ -54,11 +54,12 @@ Fair question — sites like SecurityHeaders or Mozilla Observatory grade a page
 
 | Area | Checks |
 | --- | --- |
-| Transport | HTTPS in place, HTTP → HTTPS redirect, TLS protocol, certificate expiry, redirect chains (downgrade hops, chains over 3 hops) |
+| Transport | HTTPS in place, HTTP → HTTPS redirect, TLS protocol, certificate expiry, redirect chains (downgrade hops, chains over 3 hops), main-page response time (flagged over 3 s) |
 | Security headers | HSTS, Content-Security-Policy (incl. `unsafe-inline` / `unsafe-eval` / wildcard sources), X-Content-Type-Options, clickjacking, Referrer-Policy, Permissions-Policy |
 | Cookies | Secure, HttpOnly (on session-like cookies), SameSite |
 | CORS | Arbitrary-origin reflection, `*` combined with credentials |
 | Exposed files | `/.env`, `/.git/HEAD`, `/.git/config` |
+| Exposed services | Database ports open to the internet — MySQL/MariaDB (3306), PostgreSQL (5432), Redis (6379), MongoDB (27017), plain TCP connect |
 | Page content | Mixed content (HTTP subresources on an HTTPS page), cross-origin scripts without Subresource Integrity |
 | Methods & discovery | HTTP TRACE enabled, missing `/.well-known/security.txt` |
 | Isolation | Cross-Origin-Opener-Policy, Cross-Origin-Resource-Policy, CSP hardening directives (object-src / base-uri) |
@@ -103,6 +104,7 @@ sitevigil example.com --baseline monday.json        # next week: what regressed?
 sitevigil example.com --crawl 10                    # audit up to 10 pages (sitemap.xml, else homepage links)
 sitevigil example.com --badge > badge.svg           # an SVG score badge for your README
 sitevigil example.com --no-cve                      # skip the CVE lookup (faster, fully offline)
+sitevigil example.com --no-ports                    # skip the exposed-database-port check
 sitevigil example.com --html --output report.html   # write any format straight to a file
 ```
 
@@ -124,6 +126,7 @@ Your agent gets two tools: `audit_site` (the full scored report) and `suggest_fi
 ## Honest limits
 
 - It audits the response of the URL you give it (plus `/.env` / `/.git` probes). It is not a vulnerability scanner and it does not fuzz, brute-force, or log in anywhere.
+- The database-port check is a plain TCP connect to four well-known ports: no banner grabbing, no login attempts. A firewalled port counts as closed — the check claims reachability, nothing more.
 - Only audit sites you own or have permission to test. The probes are read-only `GET`s, but scanning other people's property without permission is still a bad idea.
 - A high score means these basics are in place. It is not a guarantee that a site is secure.
 

@@ -4,6 +4,24 @@ SiteVigil versions its audit ruleset separately (shown in every report
 and via `sitevigil --checks`) so results stay comparable over time and
 changes to what is checked are never silent.
 
+## 0.9.0 — ruleset 2026.11
+
+- Response time: every report now carries `response_time_ms` for the
+  main document fetch (shown in text and Markdown output), and a main
+  page that takes over 3 seconds end to end earns a `slow-response`
+  finding. Latency was the one basic signal the audit did not measure.
+- Exposed database ports: a plain TCP connect checks whether MySQL/
+  MariaDB (3306), PostgreSQL (5432), Redis (6379) or MongoDB (27017)
+  answer on the audited host's public interface — an open one is a
+  high-severity `db-port-exposed` finding. Connect only: no banner
+  grab, no login attempt. Runs once per host (crawl does not re-probe
+  per page); `--no-ports` opts out. Ruleset grows to 42 checks.
+  The connect reuses the proxy-aware path from the TLS check: behind
+  an HTTP proxy a naive connect succeeds for every port (the proxy
+  answers handshakes itself), so the verdict comes from the CONNECT
+  response instead — the first live run without this reported four
+  open database ports on a site that has none.
+
 ## 0.8.1 — ruleset 2026.11
 
 - Packaging fix: the 0.8.0 PyPI metadata shipped without trove

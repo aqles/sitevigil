@@ -281,6 +281,90 @@ class AuditTest(unittest.TestCase):
         finally:
             server.shutdown()
 
+    def test_v09_latency_and_db_ports(self):
+        import socket as sock
+
+        import sitevigil.audit as m
+
+        # latency: the field rides along on every report; a fast local
+        # fixture must not trip the slow finding; no db ports open here
+        report = audit(self.base)
+        self.assertIn("response_time_ms", report)
+        self.assertIsInstance(report["response_time_ms"], int)
+        ids = [f["id"] for f in report["findings"]]
+        self.assertNotIn("slow-response", ids)
+        self.assertEqual(report["open_db_ports"], [])
+        self.assertNotIn("db-port-exposed", ids)
+
+        # slow threshold: with a 0 ms budget any fetch counts as slow
+        old_budget = m.SLOW_RESPONSE_MS
+        m.SLOW_RESPONSE_MS = 0
+        try:
+            slow = audit(self.base, ports=False)
+        finally:
+            m.SLOW_RESPONSE_MS = old_budget
+        self.assertIn("slow-response", [f["id"] for f in slow["findings"]])
+
+        # exposed port: a real TCP listener standing in for a database
+        listener = sock.socket()
+        listener.setsockopt(sock.SOL_SOCKET, sock.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        fake_port = listener.getsockname()[1]
+        old_ports = m.DB_PORTS
+        m.DB_PORTS = {fake_port: "TestDB"}
+        try:
+            exposed = audit(self.base)
+        finally:
+            m.DB_PORTS = old_ports
+            listener.close()
+        self.assertEqual(exposed["open_db_ports"], [fake_port])
+        hit = [f for f in exposed["findings"] if f["id"] == "db-port-exposed"]
+        self.assertEqual(len(hit), 1)
+        self.assertEqual(hit[0]["severity"], "high")
+        self.assertIn("TestDB", hit[0]["title"])
+
+    def test_v09_db_ports_behind_proxy(self):
+        # Behind an HTTP proxy a naive connect "succeeds" for every port
+        # (the proxy answers the handshake itself). The check must trust
+        # only the CONNECT verdict: 200 = open, anything else = closed.
+        import os
+        import socket as sock
+        from unittest import mock
+
+        import sitevigil.audit as m
+
+        proxy = sock.socket()
+        proxy.setsockopt(sock.SOL_SOCKET, sock.SO_REUSEADDR, 1)
+        proxy.bind(("127.0.0.1", 0))
+        proxy.listen(5)
+        proxy_port = proxy.getsockname()[1]
+
+        def serve():
+            for _ in range(2):
+                conn, _ = proxy.accept()
+                req = conn.recv(4096).decode("utf-8", "ignore")
+                ok = ":1111 " in req  # only the fake-open port gets a 200
+                conn.sendall(b"HTTP/1.1 200 OK\r\n\r\n" if ok
+                             else b"HTTP/1.1 403 Forbidden\r\n\r\n")
+                conn.close()
+            proxy.close()
+
+        threading.Thread(target=serve, daemon=True).start()
+        old_ports = m.DB_PORTS
+        m.DB_PORTS = {1111: "OpenDB", 2222: "ShutDB"}
+        env = dict(os.environ, https_proxy=f"http://127.0.0.1:{proxy_port}",
+                   HTTPS_PROXY=f"http://127.0.0.1:{proxy_port}", no_proxy="")
+        try:
+            with mock.patch.dict(os.environ, env, clear=False):
+                found: list = []
+                opened = m._check_db_ports(
+                    "dbtest.invalid", lambda *a: found.append(a[0]))
+        finally:
+            m.DB_PORTS = old_ports
+        self.assertEqual(opened, [1111])
+        self.assertEqual(found, ["db-port-exposed"])
+
     def test_banner(self):
         import contextlib
         import io

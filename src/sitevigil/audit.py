@@ -16,6 +16,7 @@ import json
 import re
 import socket
 import ssl
+import time
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from urllib.error import HTTPError, URLError
@@ -71,7 +72,15 @@ CHECKS = [
     ("powered-by-header", "info", "Server / X-Powered-By do not disclose stack details", "https://owasp.org/www-project-web-security-testing-guide/"),
     ("cve-*", "varies", "Known CVEs affecting the detected software version (NVD)", "https://nvd.nist.gov/"),
     ("cve-overflow", "info", "Total known-CVE count when more than 10 match a version", "https://nvd.nist.gov/"),
+    ("slow-response", "low", "Main page responds within 3 seconds", "https://developer.mozilla.org/en-US/docs/Web/Performance"),
+    ("db-port-exposed", "high", "Database ports (MySQL/PostgreSQL/Redis/MongoDB) are not open to the internet", "https://owasp.org/www-project-web-security-testing-guide/"),
 ]
+
+# Latency budget for the main document fetch, and the well-known database
+# ports that should never be reachable from the public internet.
+SLOW_RESPONSE_MS = 3000
+DB_PORTS = {3306: "MySQL/MariaDB", 5432: "PostgreSQL",
+            6379: "Redis", 27017: "MongoDB"}
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -260,7 +269,8 @@ class _PageParser(HTMLParser):
                 (tag, urljoin(self.base, url), bool(a.get("integrity"))))
 
 
-def audit(raw_url: str, timeout: float = 10.0, cve: bool = True) -> dict:
+def audit(raw_url: str, timeout: float = 10.0, cve: bool = True,
+          ports: bool = True) -> dict:
     url = raw_url if "://" in raw_url else f"https://{raw_url}"
     parsed = urlparse(url)
     host = parsed.hostname or ""
@@ -271,12 +281,24 @@ def audit(raw_url: str, timeout: float = 10.0, cve: bool = True) -> dict:
                          "detail": detail, "fix": fix})
 
     # --- Reachability + main response -------------------------------------
+    started = time.perf_counter()
     try:
         status, headers, body, final_url = _fetch(url, timeout)
     except (URLError, socket.timeout, OSError) as e:
         return {"url": url, "reachable": False, "error": str(e),
                 "score": 0, "grade": "F", "findings": []}
+    response_ms = round((time.perf_counter() - started) * 1000)
     is_https = urlparse(final_url).scheme == "https"
+
+    if response_ms > SLOW_RESPONSE_MS:
+        add("slow-response", "low", "Main page response is slow",
+            f"Fetching {final_url} took {response_ms} ms end to end "
+            f"(budget {SLOW_RESPONSE_MS} ms). A slow first response delays "
+            "everything else on the page and usually means an overloaded "
+            "origin, a cold cache, or a distant region.",
+            "Profile where the time goes (origin CPU, database queries, "
+            "cache misses); serve through a CDN/cache and from a region "
+            "close to your users.")
 
     # --- Redirect chain -----------------------------------------------------
     chain = _redirect_chain(url, timeout)
@@ -549,12 +571,18 @@ def audit(raw_url: str, timeout: float = 10.0, cve: bool = True) -> dict:
                     f"Upgrade {fp['name']} to a supported release; the long "
                     "tail of old CVEs disappears with it.")
 
+    # --- Exposed database ports --------------------------------------------
+    open_db_ports: list[int] = []
+    if ports:
+        open_db_ports = _check_db_ports(host, add)
+
     score = max(0, 100 - sum(WEIGHTS[f["severity"]] for f in findings))
     grade = ("A" if score >= 90 else "B" if score >= 80 else
              "C" if score >= 65 else "D" if score >= 50 else "F")
     return {"url": url, "final_url": final_url, "status": status,
             "reachable": True, "platform": _detect_platform(headers),
             "ruleset": RULESET_VERSION, "redirect_chain": chain,
+            "response_time_ms": response_ms, "open_db_ports": open_db_ports,
             "software": software,
             "tls": tls, "score": score, "grade": grade,
             "findings": findings}
@@ -994,6 +1022,39 @@ def _cve_lookup(product_key: str, version: str) -> list[dict] | None:
     return out
 
 
+def _check_db_ports(host: str, add, timeout: float = 2.5) -> list[int]:
+    """TCP-connect to well-known database ports; an open one is a finding.
+
+    A plain connect only -- no banner grab, no login attempt. A refused or
+    timed-out connection counts as closed: a firewalled port is
+    indistinguishable from a filtered drop, and either way the database is
+    not reachable from outside, which is all this check claims.
+
+    The connect goes through _tls_connect so it stays truthful behind an
+    HTTP proxy: a proxy completes every handshake itself, so a naive
+    direct connect behind one "succeeds" for every port on every host --
+    the CONNECT response is the only honest signal there.
+    """
+    open_ports: list[int] = []
+    for port, service in DB_PORTS.items():
+        try:
+            sock = _tls_connect(host, port, timeout=timeout)
+            sock.close()
+            open_ports.append(port)
+            add("db-port-exposed", "high",
+                f"{service} port {port} is open to the internet",
+                f"A TCP connection to {host}:{port} succeeded from "
+                "outside the network. Anyone on the internet can "
+                "attempt to talk to this database service.",
+                "Bind the database to localhost or a private network "
+                "and firewall the port; application servers should "
+                "reach it over a private interface or a tunnel, never "
+                "the public internet.")
+        except OSError:
+            pass
+    return open_ports
+
+
 def _check_tls(host: str, port: int, add) -> dict:
     info: dict = {}
     try:
@@ -1068,6 +1129,8 @@ def to_markdown(report: dict) -> str:
              "",
              f"**Score: {report['score']}/100 (grade {report['grade']})** · "
              f"HTTP {report['status']}"
+             + (f" · response {report['response_time_ms']} ms"
+                if "response_time_ms" in report else "")
              + (f" · TLS expires in {report['tls']['expires_in_days']} days"
                 if "expires_in_days" in report.get("tls", {}) else ""),
              ""]
@@ -1083,7 +1146,9 @@ def to_text(report: dict) -> str:
     if not report.get("reachable"):
         return f"{report['url']} — UNREACHABLE: {report.get('error')}"
     lines = [f"{report['final_url']}",
-             f"Score: {report['score']}/100  Grade: {report['grade']}  HTTP {report['status']}"]
+             f"Score: {report['score']}/100  Grade: {report['grade']}  HTTP {report['status']}"
+             + (f"  Response: {report['response_time_ms']} ms"
+                if "response_time_ms" in report else "")]
     if report.get("software"):
         lines.append("Software: " + ", ".join(
             f"{s['name']} {s['version']} (via {s['via']})"

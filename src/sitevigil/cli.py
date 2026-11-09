@@ -4,6 +4,7 @@ import io
 import json
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 
 from . import __version__
 from .audit import (CHECKS, RULESET_VERSION, audit, compare_reports,
@@ -59,6 +60,9 @@ def main(argv=None) -> int:
     parser.add_argument("--no-cve", action="store_true",
                         help="Skip the known-vulnerability (CVE) lookup "
                              "against NVD (faster, fully offline)")
+    parser.add_argument("--no-ports", action="store_true",
+                        help="Skip the exposed-database-port check "
+                             "(TCP connect to MySQL/PostgreSQL/Redis/MongoDB ports)")
     parser.add_argument("--output", metavar="FILE",
                         help="Write the report to FILE instead of stdout "
                              "(the banner is left out of files)")
@@ -92,8 +96,15 @@ def main(argv=None) -> int:
         args.urls = discover_urls(args.urls[0], timeout=args.timeout,
                                   limit=args.crawl)
 
-    reports = [audit(u, timeout=args.timeout, cve=not args.no_cve)
-               for u in args.urls]
+    # Port checks run once per host: crawling one site must not re-probe
+    # the same ports for every page.
+    reports = []
+    seen_hosts: set[str] = set()
+    for u in args.urls:
+        host = urlparse(u if "://" in u else f"https://{u}").hostname or ""
+        reports.append(audit(u, timeout=args.timeout, cve=not args.no_cve,
+                             ports=not args.no_ports and host not in seen_hosts))
+        seen_hosts.add(host)
 
     comparison = None
     if args.baseline:
