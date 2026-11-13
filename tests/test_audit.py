@@ -365,6 +365,32 @@ class AuditTest(unittest.TestCase):
         self.assertEqual(opened, [1111])
         self.assertEqual(found, ["db-port-exposed"])
 
+    def test_v10_color_progress_html(self):
+        from sitevigil.audit import AUDIT_PHASES, to_html, to_text
+
+        report = audit(self.base)
+
+        # colour: on when asked, never by default (pipes/files stay plain)
+        self.assertNotIn("\x1b[", to_text(report))
+        coloured = to_text(report, color=True)
+        self.assertIn("\x1b[", coloured)
+        self.assertIn("Summary:", coloured)
+
+        # progress: every phase, in order, exactly once per audit
+        seen: list = []
+        audit(self.base, ports=False,
+              progress=lambda label, done, total: seen.append((label, done, total)))
+        self.assertEqual([s[0] for s in seen], AUDIT_PHASES)
+        self.assertEqual([s[1] for s in seen], list(range(1, len(AUDIT_PHASES) + 1)))
+        self.assertTrue(all(s[2] == len(AUDIT_PHASES) for s in seen))
+
+        # HTML: dark theme, severity chips, response time in the meta line
+        page = to_html(report)
+        self.assertIn("#0d1117", page)
+        self.assertIn("chip", page)
+        self.assertIn("Response", page)
+        self.assertNotIn("background:#eaeef2", page)  # old light theme
+
     def test_banner(self):
         import contextlib
         import io

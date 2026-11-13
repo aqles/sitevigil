@@ -4,6 +4,26 @@ SiteVigil versions its audit ruleset separately (shown in every report
 and via `sitevigil --checks`) so results stay comparable over time and
 changes to what is checked are never silent.
 
+## 0.10.0 — ruleset 2026.11
+
+- Colour in the terminal: severity tags, score and grade are coloured
+  (critical red, high yellow, medium cyan, low/info grey), the banner
+  prints in green, and a one-line summary counts findings per severity.
+  Colour is on only for a real terminal — pipes, files, CI logs and
+  machine formats stay plain — and `--no-color` (or `NO_COLOR`) turns
+  it off anywhere.
+- Live scan progress: an interactive run shows a spinner + progress
+  bar through the eight audit phases (fetch, redirect chain, TLS,
+  headers, cookies/CORS, DNS, CVE, database ports) on stderr, so a
+  slow scan no longer looks frozen. Off by default outside a terminal;
+  `--no-progress` forces it off. The audit reports phases through a
+  `progress` callback, so MCP and library callers are unaffected.
+- The HTML report is now a dark hacker theme: near-black background,
+  green accents, severity chips with per-severity counts, and a meta
+  line (HTTP status, response time, platform, ruleset).
+- Housekeeping: the User-Agent now tracks the package version instead
+  of a hardcoded `0.8`.
+
 ## 0.9.0 — ruleset 2026.11
 
 - Response time: every report now carries `response_time_ms` for the

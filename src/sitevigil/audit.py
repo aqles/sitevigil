@@ -23,7 +23,9 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse
 from urllib.request import Request, build_opener, HTTPRedirectHandler
 
-USER_AGENT = "SiteVigil/0.8 (+https://github.com/aqles/sitevigil)"
+from . import __version__
+
+USER_AGENT = f"SiteVigil/{__version__} (+https://github.com/aqles/sitevigil)"
 WEIGHTS = {"critical": 25, "high": 15, "medium": 8, "low": 3, "info": 0}
 MAX_BODY = 65536
 
@@ -81,6 +83,30 @@ CHECKS = [
 SLOW_RESPONSE_MS = 3000
 DB_PORTS = {3306: "MySQL/MariaDB", 5432: "PostgreSQL",
             6379: "Redis", 27017: "MongoDB"}
+
+# The audit's phases, in order, reported to a progress callback as
+# progress(label, done, total). The CLI turns this into a spinner bar;
+# library and MCP callers simply pass nothing and get no output.
+AUDIT_PHASES = ["Fetching page", "Redirect chain", "TLS certificate",
+                "Security headers", "Cookies, CORS & exposed files",
+                "DNS records", "CVE lookup (NVD)", "Database ports"]
+
+# ANSI colours for terminal output. Stdlib only, no colour library.
+_ANSI = {"reset": "\x1b[0m", "bold": "\x1b[1m", "dim": "\x1b[2m",
+         "red": "\x1b[31m", "green": "\x1b[32m", "yellow": "\x1b[33m",
+         "blue": "\x1b[34m", "cyan": "\x1b[36m", "grey": "\x1b[90m",
+         "bright_red": "\x1b[91m", "bright_yellow": "\x1b[93m"}
+_SEV_COLOR = {"critical": "bright_red", "high": "yellow", "medium": "cyan",
+              "low": "grey", "info": "grey"}
+
+
+def _paint(text: str, colour: str, on: bool) -> str:
+    return f"{_ANSI[colour]}{text}{_ANSI['reset']}" if on else text
+
+
+def _score_colour(score: int) -> str:
+    return ("green" if score >= 90 else "blue" if score >= 80
+            else "yellow" if score >= 65 else "red")
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -270,7 +296,7 @@ class _PageParser(HTMLParser):
 
 
 def audit(raw_url: str, timeout: float = 10.0, cve: bool = True,
-          ports: bool = True) -> dict:
+          ports: bool = True, progress=None) -> dict:
     url = raw_url if "://" in raw_url else f"https://{raw_url}"
     parsed = urlparse(url)
     host = parsed.hostname or ""
@@ -279,6 +305,10 @@ def audit(raw_url: str, timeout: float = 10.0, cve: bool = True,
     def add(fid, severity, title, detail, fix):
         findings.append({"id": fid, "severity": severity, "title": title,
                          "detail": detail, "fix": fix})
+
+    def step(n: int) -> None:
+        if progress is not None:
+            progress(AUDIT_PHASES[n - 1], n, len(AUDIT_PHASES))
 
     # --- Reachability + main response -------------------------------------
     started = time.perf_counter()
@@ -299,6 +329,7 @@ def audit(raw_url: str, timeout: float = 10.0, cve: bool = True,
             "Profile where the time goes (origin CPU, database queries, "
             "cache misses); serve through a CDN/cache and from a region "
             "close to your users.")
+    step(1)
 
     # --- Redirect chain -----------------------------------------------------
     chain = _redirect_chain(url, timeout)
@@ -315,6 +346,7 @@ def audit(raw_url: str, timeout: float = 10.0, cve: bool = True,
             + (" -> ..." if len(chain) > 6 else ""),
             "Collapse the chain to at most 1-2 hops pointing straight at the "
             "final URL; each hop costs a round trip and can break HSTS coverage.")
+    step(2)
 
     # --- HTTP -> HTTPS redirect -------------------------------------------
     if parsed.scheme == "https" or is_https:
@@ -345,6 +377,8 @@ def audit(raw_url: str, timeout: float = 10.0, cve: bool = True,
             add("http2-not-offered", "info", "HTTP/2 was not negotiated",
                 f"ALPN result: {tls.get('alpn') or 'none'}.",
                 "Enable HTTP/2 at the server/CDN for faster, multiplexed loads.")
+
+    step(3)
 
     # --- Security headers ---------------------------------------------------
     hsts = _first(headers, "strict-transport-security")
@@ -439,6 +473,8 @@ def audit(raw_url: str, timeout: float = 10.0, cve: bool = True,
             add(fid, "info", f"{name} header discloses software details",
                 f"{name}: {value}",
                 f"Remove or genericise the {name} header so attackers learn less about your stack.")
+
+    step(4)
 
     # --- Cookies ---------------------------------------------------------------
     for raw in headers.get("set-cookie", []):
@@ -537,8 +573,11 @@ def audit(raw_url: str, timeout: float = 10.0, cve: bool = True,
     except (URLError, socket.timeout, OSError):
         pass
 
+    step(5)
+
     # --- Domain email / issuance records (DNS-over-HTTPS) -------------------
     _check_domain(host, add)
+    step(6)
 
     # --- Known vulnerabilities for fingerprinted software -------------------
     body_text = body.decode("utf-8", errors="ignore") if body else ""
@@ -571,10 +610,13 @@ def audit(raw_url: str, timeout: float = 10.0, cve: bool = True,
                     f"Upgrade {fp['name']} to a supported release; the long "
                     "tail of old CVEs disappears with it.")
 
+    step(7)
+
     # --- Exposed database ports --------------------------------------------
     open_db_ports: list[int] = []
     if ports:
         open_db_ports = _check_db_ports(host, add)
+    step(8)
 
     score = max(0, 100 - sum(WEIGHTS[f["severity"]] for f in findings))
     grade = ("A" if score >= 90 else "B" if score >= 80 else
@@ -1142,11 +1184,16 @@ def to_markdown(report: dict) -> str:
     return "\n".join(lines)
 
 
-def to_text(report: dict) -> str:
+def to_text(report: dict, color: bool = False) -> str:
+    """Terminal report. Colour is off by default: the CLI turns it on only
+    for a real terminal (never for pipes, files, or --json/--markdown)."""
     if not report.get("reachable"):
         return f"{report['url']} — UNREACHABLE: {report.get('error')}"
+    score_c = _score_colour(report["score"])
     lines = [f"{report['final_url']}",
-             f"Score: {report['score']}/100  Grade: {report['grade']}  HTTP {report['status']}"
+             f"Score: {_paint(str(report['score']), score_c, color)}/100  "
+             f"Grade: {_paint(report['grade'], score_c, color)}  "
+             f"HTTP {report['status']}"
              + (f"  Response: {report['response_time_ms']} ms"
                 if "response_time_ms" in report else "")]
     if report.get("software"):
@@ -1157,38 +1204,69 @@ def to_text(report: dict) -> str:
     if not report["findings"]:
         lines.append("No findings. Nice work.")
     for f in report["findings"]:
-        lines += [f"[{f['severity'].upper():8}] {f['title']}",
+        tag = _paint(f"[{f['severity'].upper():8}]", _SEV_COLOR[f["severity"]], color)
+        lines += [f"{tag} {_paint(f['title'], 'bold', color)}",
                   f"           {f['detail']}",
                   f"           Fix: {f['fix']}"]
+    if report["findings"]:
+        counts = {s: sum(1 for f in report["findings"] if f["severity"] == s)
+                  for s in ("critical", "high", "medium", "low", "info")}
+        parts = [_paint(f"{n} {s}", _SEV_COLOR[s], color)
+                 for s, n in counts.items() if n]
+        lines += ["", "Summary: " + "  ·  ".join(parts)]
     return "\n".join(lines)
 
 
 def to_html(report: dict) -> str:
-    """One self-contained HTML page (inline CSS, no external assets)."""
+    """One self-contained HTML page (inline CSS, dark hacker theme)."""
+    style = ("body{background:#0d1117;color:#e6edf3;font-family:system-ui,sans-serif;"
+             "max-width:760px;margin:2rem auto;padding:0 1rem}"
+             "a{color:#00ff41}.meta{color:#8b949e}"
+             ".chip{display:inline-block;border:1px solid;border-radius:999px;"
+             "padding:.15rem .6rem;margin:.2rem .25rem .2rem 0;font-size:.85rem}"
+             "section{background:#161b22;border:1px solid #30363d;border-left:4px solid;"
+             "border-radius:8px;padding:1rem;margin:1rem 0}"
+             ".sev{font-size:.75rem;padding:.15rem .5rem;border-radius:999px;"
+             "color:#0d1117;font-weight:700}h3{margin:.2rem 0}p{color:#c9d1d9}")
     if not report.get("reachable"):
-        return (f"<h1>SiteVigil</h1><p>{html.escape(report['url'])} — "
-                f"unreachable: {html.escape(str(report.get('error')))}</p>")
-    colour = ("#1a7f37" if report["score"] >= 90 else "#1f6feb" if report["score"] >= 80
-              else "#bf8700" if report["score"] >= 65 else "#bc4c00" if report["score"] >= 50
-              else "#cf222e")
+        return (f"<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+                f"<style>{style}</style></head>"
+                f"<body><h1>SiteVigil</h1><p>{html.escape(report['url'])} — "
+                f"unreachable: {html.escape(str(report.get('error')))}</p></body></html>")
+    score_hex = ("#3fb950" if report["score"] >= 90 else "#58a6ff" if report["score"] >= 80
+                 else "#d29922" if report["score"] >= 65 else "#f0883e" if report["score"] >= 50
+                 else "#f85149")
+    sev_hex = {"critical": "#f85149", "high": "#f0883e", "medium": "#d29922",
+               "low": "#8b949e", "info": "#58a6ff"}
+    counts = {s: sum(1 for f in report["findings"] if f["severity"] == s)
+              for s in ("critical", "high", "medium", "low", "info")}
+    chips = "".join(
+        f"<span class='chip' style='border-color:{sev_hex[s]};color:{sev_hex[s]}'>"
+        f"{n} {s}</span>" for s, n in counts.items() if n)
+    meta = " · ".join([
+        f"HTTP {report['status']}",
+        f"Response {report.get('response_time_ms', '?')} ms",
+        f"Platform: {report.get('platform', '?')}",
+        f"Ruleset {report.get('ruleset', '?')}",
+    ])
     rows = "".join(
-        f"<section><h3><span class='sev {f['severity']}'>{f['severity'].upper()}</span> "
-        f"{html.escape(f['title'])}</h3><p>{html.escape(f['detail'])}</p>"
+        f"<section style='border-left-color:{sev_hex[f['severity']]}'>"
+        f"<h3><span class='sev' style='background:{sev_hex[f['severity']]}'>"
+        f"{f['severity'].upper()}</span> {html.escape(f['title'])}</h3>"
+        f"<p>{html.escape(f['detail'])}</p>"
         f"<p><strong>Fix:</strong> {html.escape(f['fix'])}</p></section>"
         for f in report["findings"]) or "<p>No findings. Nice work.</p>"
     return f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <title>SiteVigil — {html.escape(report['final_url'])}</title>
-<style>body{{font-family:system-ui,sans-serif;max-width:760px;margin:2rem auto;padding:0 1rem;color:#1f2328}}
-.score{{font-size:2.2rem;font-weight:700;color:{colour}}} section{{border:1px solid #d0d7de;border-radius:8px;padding:1rem;margin:1rem 0}}
-.sev{{font-size:.75rem;padding:.15rem .5rem;border-radius:999px;background:#eaeef2}}
-.sev.critical{{background:#cf222e;color:#fff}} .sev.high{{background:#bc4c00;color:#fff}}
-.sev.medium{{background:#bf8700;color:#fff}} h3{{margin:.2rem 0}}</style></head>
+<style>{style}.score{{font-size:2.4rem;font-weight:700;color:{score_hex}}}</style></head>
 <body><h1>SiteVigil report</h1>
 <p>{html.escape(report['final_url'])}</p>
 <p class="score">{report['score']}/100 — grade {report['grade']}</p>
+<p class="meta">{html.escape(meta)}</p>
+<p>{chips}</p>
 {rows}
-<footer><p>Generated by SiteVigil. A high score means these basics are in place, not that a site is invulnerable.</p></footer>
+<footer><p class="meta">Generated by SiteVigil. A high score means these basics are in place, not that a site is invulnerable.</p></footer>
 </body></html>"""
 
 

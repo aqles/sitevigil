@@ -2,6 +2,7 @@
 import argparse
 import io
 import json
+import os
 import sys
 from pathlib import Path
 from urllib.parse import urlparse
@@ -22,6 +23,32 @@ BANNER = r"""
    |                                                |               |
    .                                                .              \___/
 """.strip("\n")
+
+
+class _Progress:
+    """One-line spinner + progress bar on stderr, for interactive runs.
+
+    Drawn on stderr so stdout stays clean for pipes and files. Only used
+    when the caller already decided this is a real terminal.
+    """
+    FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    WIDTH = 20
+
+    def __init__(self, stream):
+        self.stream = stream
+        self.i = 0
+
+    def __call__(self, label, done, total):
+        self.i += 1
+        filled = int(self.WIDTH * done / total)
+        bar = "█" * filled + "░" * (self.WIDTH - filled)
+        frame = self.FRAMES[self.i % len(self.FRAMES)]
+        self.stream.write(f"\r{frame} [{bar}] {done}/{total} {label}... ")
+        self.stream.flush()
+
+    def finish(self):
+        self.stream.write("\r" + " " * 72 + "\r")
+        self.stream.flush()
 
 
 def main(argv=None) -> int:
@@ -63,6 +90,11 @@ def main(argv=None) -> int:
     parser.add_argument("--no-ports", action="store_true",
                         help="Skip the exposed-database-port check "
                              "(TCP connect to MySQL/PostgreSQL/Redis/MongoDB ports)")
+    parser.add_argument("--no-color", action="store_true",
+                        help="Disable coloured terminal output (also off when "
+                             "stdout is not a terminal, or NO_COLOR is set)")
+    parser.add_argument("--no-progress", action="store_true",
+                        help="Disable the live scan spinner/progress bar")
     parser.add_argument("--output", metavar="FILE",
                         help="Write the report to FILE instead of stdout "
                              "(the banner is left out of files)")
@@ -96,6 +128,15 @@ def main(argv=None) -> int:
         args.urls = discover_urls(args.urls[0], timeout=args.timeout,
                                   limit=args.crawl)
 
+    # Colour and the live spinner only exist on a real terminal; pipes,
+    # files, CI logs and machine formats get plain output by default.
+    use_color = (sys.stdout.isatty() and not args.no_color
+                 and "NO_COLOR" not in os.environ)
+    structured = args.json or args.markdown or args.html or args.badge
+    progress = (_Progress(sys.stderr)
+                if sys.stderr.isatty() and not args.no_progress
+                and not structured else None)
+
     # Port checks run once per host: crawling one site must not re-probe
     # the same ports for every page.
     reports = []
@@ -103,8 +144,11 @@ def main(argv=None) -> int:
     for u in args.urls:
         host = urlparse(u if "://" in u else f"https://{u}").hostname or ""
         reports.append(audit(u, timeout=args.timeout, cve=not args.no_cve,
-                             ports=not args.no_ports and host not in seen_hosts))
+                             ports=not args.no_ports and host not in seen_hosts,
+                             progress=progress))
         seen_hosts.add(host)
+    if progress is not None:
+        progress.finish()
 
     comparison = None
     if args.baseline:
@@ -136,10 +180,10 @@ def main(argv=None) -> int:
         print("\n\n---\n\n".join(to_markdown(r) for r in reports))
     else:
         if not args.no_banner:
-            print(BANNER)
+            print(f"\x1b[32m{BANNER}\x1b[0m" if use_color else BANNER)
             print(f" v{__version__} — website security audit, ruleset {RULESET_VERSION}\n")
         for r in reports:
-            print(to_text(r))
+            print(to_text(r, color=use_color))
             print()
             if args.fix:
                 fix = generate_fix(r)

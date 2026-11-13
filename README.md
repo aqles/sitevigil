@@ -110,6 +110,8 @@ sitevigil example.com --html --output report.html   # write any format straight 
 
 Scoring starts at 100 and loses points per finding (critical 25, high 15, medium 8, low 3), ending in a grade from A to F.
 
+In a terminal, output is coloured (severity tags, score, grade) and a spinner + progress bar walks through the eight audit phases while the scan runs — both switch off automatically for pipes, files, and `--json`/`--markdown`/`--html`, or with `--no-color` / `--no-progress` (`NO_COLOR` is honoured too). The HTML report is a dark theme with severity chips and a per-severity summary.
+
 ## Let your AI agent use it
 
 SiteVigil ships an MCP server (still stdlib-only). Local agents use stdio; hosted agents can use the HTTP transport:
