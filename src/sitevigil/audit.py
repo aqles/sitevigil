@@ -19,6 +19,7 @@ import ssl
 import time
 from datetime import datetime, timezone
 from html.parser import HTMLParser
+from http.client import IncompleteRead
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse
 from urllib.request import Request, build_opener, HTTPRedirectHandler
@@ -121,6 +122,21 @@ class _NoRedirect(HTTPRedirectHandler):
         return None
 
 
+def _read_body(resp) -> bytes:
+    """Read up to MAX_BODY bytes; a truncated body reads as what
+    actually arrived. Some servers answer an error page with a chunked
+    body and then close the connection mid-body: http.client raises
+    IncompleteRead for that, and a failed body read must never kill
+    the whole audit (it crashed a live run against ednasalam.com,
+    whose 404 for a probed path is truncated)."""
+    try:
+        return resp.read(MAX_BODY)
+    except IncompleteRead as e:
+        return e.partial or b""
+    except Exception:
+        return b""
+
+
 def _fetch(url: str, timeout: float, headers: dict | None = None,
            follow: bool = True, method: str = "GET",
            data: bytes | None = None):
@@ -130,9 +146,9 @@ def _fetch(url: str, timeout: float, headers: dict | None = None,
     opener = build_opener() if follow else build_opener(_NoRedirect)
     try:
         with opener.open(req, timeout=timeout) as resp:
-            return resp.status, _group(resp.headers), resp.read(MAX_BODY), resp.geturl()
+            return resp.status, _group(resp.headers), _read_body(resp), resp.geturl()
     except HTTPError as e:
-        return e.code, _group(e.headers), e.read(MAX_BODY), url
+        return e.code, _group(e.headers), _read_body(e), url
 
 
 def _group(headers) -> dict:
@@ -213,11 +229,11 @@ def discover_urls(start_url: str, timeout: float = 10.0, limit: int = 5) -> list
         _, _, sm_body, _ = _fetch(base + "/sitemap.xml", timeout)
         locs = re.findall(r"<loc>\s*([^<]+?)\s*</loc>",
                           sm_body.decode("utf-8", errors="ignore"))
-        if any(u.endswith(".xml") for u in locs):
-            for child in locs[:1]:
-                _, _, child_body, _ = _fetch(child, timeout)
-                locs = re.findall(r"<loc>\s*([^<]+?)\s*</loc>",
-                                  child_body.decode("utf-8", errors="ignore"))
+        xml_children = [u for u in locs if u.endswith(".xml")]
+        if xml_children:
+            _, _, child_body, _ = _fetch(xml_children[0], timeout)
+            locs = re.findall(r"<loc>\s*([^<]+?)\s*</loc>",
+                              child_body.decode("utf-8", errors="ignore"))
         for u in locs:
             push(u)
     except (URLError, socket.timeout, OSError):
@@ -264,6 +280,35 @@ def _hsts_preload_ready(hsts: str) -> bool:
     m = re.search(r"max-age=(\d+)", low)
     return bool(m and int(m.group(1)) >= 31536000
                 and "includesubdomains" in low and "preload" not in low)
+
+
+def _check_hsts(hsts: str | None, add) -> None:
+    """HSTS findings for one Strict-Transport-Security header value."""
+    if not hsts:
+        add("hsts-missing", "medium", "Missing Strict-Transport-Security header",
+            "No HSTS header on the HTTPS response.",
+            "Add: Strict-Transport-Security: max-age=31536000; includeSubDomains")
+        return
+    m = re.search(r"max-age=(\d+)", hsts)
+    if not m:
+        add("hsts-short", "low", "HSTS header has no max-age",
+            f"HSTS is '{hsts}': without max-age browsers treat it "
+            "as max-age=0, so the header does nothing.",
+            "Set max-age explicitly, e.g. Strict-Transport-Security: "
+            "max-age=31536000; includeSubDomains")
+    elif int(m.group(1)) < 15552000:
+        add("hsts-short", "low", "HSTS max-age is short",
+            f"HSTS max-age is {m.group(1)} seconds (under 180 days).",
+            "Raise max-age to at least 31536000 (one year).")
+    elif _hsts_preload_ready(hsts):
+        add("hsts-preload", "info",
+            "HSTS meets browser preload requirements but is not preloaded",
+            f"HSTS is '{hsts}': long max-age and includeSubDomains are "
+            "set, but the preload directive is missing, so browsers "
+            "still trust-on-first-use for a visitor's very first visit.",
+            "Add '; preload' to the header and submit the domain at "
+            "hstspreload.org. Only do this when every subdomain is "
+            "HTTPS-ready: preload removal is slow.")
 
 
 def _detect_platform(headers: dict) -> str:
@@ -361,9 +406,13 @@ def audit(raw_url: str, timeout: float = 10.0, cve: bool = True,
     step(2)
 
     # --- HTTP -> HTTPS redirect -------------------------------------------
+    # The host that matters is the one the audit actually landed on:
+    # after a cross-host redirect the original host's HTTP behaviour
+    # says nothing about the site being audited.
+    final_host = urlparse(final_url).hostname or host
     if parsed.scheme == "https" or is_https:
         try:
-            s2, _, _, final2 = _fetch(f"http://{host}", timeout, follow=True)
+            s2, _, _, final2 = _fetch(f"http://{final_host}", timeout, follow=True)
             if urlparse(final2).scheme != "https":
                 add("http-no-redirect", "high", "HTTP does not redirect to HTTPS",
                     f"http://{host} answered with scheme {urlparse(final2).scheme} (status {s2}).",
@@ -379,7 +428,9 @@ def audit(raw_url: str, timeout: float = 10.0, cve: bool = True,
     # --- TLS certificate ----------------------------------------------------
     tls: dict = {}
     if is_https:
-        tls = _check_tls(host, parsed.port or 443, add)
+        final_parsed = urlparse(final_url)
+        tls = _check_tls(final_parsed.hostname or host,
+                         final_parsed.port or 443, add, timeout=timeout)
         if tls.get("protocol") in ("TLSv1", "TLSv1.1", "SSLv3", "SSLv2"):
             add("tls-weak-protocol", "high", "Server negotiated a deprecated TLS version",
                 f"Negotiated {tls['protocol']}; TLS 1.0/1.1 are deprecated (RFC 8996) "
@@ -395,25 +446,7 @@ def audit(raw_url: str, timeout: float = 10.0, cve: bool = True,
     # --- Security headers ---------------------------------------------------
     hsts = _first(headers, "strict-transport-security")
     if is_https:
-        if not hsts:
-            add("hsts-missing", "medium", "Missing Strict-Transport-Security header",
-                "No HSTS header on the HTTPS response.",
-                "Add: Strict-Transport-Security: max-age=31536000; includeSubDomains")
-        else:
-            m = re.search(r"max-age=(\d+)", hsts)
-            if m and int(m.group(1)) < 15552000:
-                add("hsts-short", "low", "HSTS max-age is short",
-                    f"HSTS max-age is {m.group(1)} seconds (under 180 days).",
-                    "Raise max-age to at least 31536000 (one year).")
-            elif m and _hsts_preload_ready(hsts):
-                add("hsts-preload", "info",
-                    "HSTS meets browser preload requirements but is not preloaded",
-                    f"HSTS is '{hsts}': long max-age and includeSubDomains are "
-                    "set, but the preload directive is missing, so browsers "
-                    "still trust-on-first-use for a visitor's very first visit.",
-                    "Add '; preload' to the header and submit the domain at "
-                    "hstspreload.org. Only do this when every subdomain is "
-                    "HTTPS-ready: preload removal is slow.")
+        _check_hsts(hsts, add)
 
     csp = _first(headers, "content-security-policy")
     if not csp:
@@ -588,7 +621,7 @@ def audit(raw_url: str, timeout: float = 10.0, cve: bool = True,
     step(5)
 
     # --- Domain email / issuance records (DNS-over-HTTPS) -------------------
-    _check_domain(host, add)
+    _check_domain(host, add, timeout=timeout)
     step(6)
 
     # --- Known vulnerabilities for fingerprinted software -------------------
@@ -640,7 +673,9 @@ def audit(raw_url: str, timeout: float = 10.0, cve: bool = True,
     # --- Exposed database ports --------------------------------------------
     open_db_ports: list[int] = []
     if ports:
-        open_db_ports = _check_db_ports(host, add)
+        # TCP connects get the audit timeout, capped: a filtered port
+        # must not burn the whole fetch budget four times over.
+        open_db_ports = _check_db_ports(host, add, timeout=min(timeout, 2.5))
     step(8)
 
     # --- Active probes (non-destructive input tests) ---------------------
@@ -762,6 +797,22 @@ def compare_reports(baseline: dict, current: dict) -> dict:
     }
 
 
+def _no_proxy_match(host: str, no_proxy: str) -> bool:
+    """Standard no_proxy matching: comma-separated entries, each an
+    exact host, a domain suffix (example.com also matches
+    api.example.com), or '*' for everything. Entries are stripped and
+    matching is case-insensitive; a bare exact `in` check misses all
+    three cases."""
+    host = host.lower()
+    for entry in no_proxy.split(","):
+        entry = entry.strip().lower().lstrip(".")
+        if not entry:
+            continue
+        if entry == "*" or host == entry or host.endswith("." + entry):
+            return True
+    return False
+
+
 def _tls_connect(host: str, port: int, timeout: float = 10):
     """TCP connection to host:port, honouring https_proxy (CONNECT) so the
     TLS check also works behind corporate proxies, where a direct socket
@@ -770,8 +821,8 @@ def _tls_connect(host: str, port: int, timeout: float = 10):
     import os
 
     proxy = os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY")
-    no_proxy = (os.environ.get("no_proxy") or "").split(",")
-    if not proxy or host in no_proxy:
+    no_proxy = os.environ.get("no_proxy") or os.environ.get("NO_PROXY") or ""
+    if not proxy or _no_proxy_match(host, no_proxy):
         return socket.create_connection((host, port), timeout=timeout)
     p = urlparse(proxy)
     raw = socket.create_connection((p.hostname, p.port or 8080), timeout=timeout)
@@ -818,7 +869,7 @@ def _doh(name: str, rtype: str, timeout: float = 5.0) -> list[str]:
             if a.get("type") == want]
 
 
-def _check_domain(host: str, add) -> None:
+def _check_domain(host: str, add, timeout: float = 5.0) -> None:
     """Email-auth and issuance records for the site's domain.
 
     Only fires when the domain actually receives mail (has MX records):
@@ -837,15 +888,15 @@ def _check_domain(host: str, add) -> None:
         pass
     domain = host[4:] if host.startswith("www.") else host
     try:
-        mx = _doh(domain, "MX")
+        mx = _doh(domain, "MX", timeout=timeout)
         if mx:
-            txt = _doh(domain, "TXT")
+            txt = _doh(domain, "TXT", timeout=timeout)
             if not any(t.strip('"').lower().startswith("v=spf1") for t in txt):
                 add("spf-missing", "low", "No SPF record for a mail-receiving domain",
                     f"{domain} has MX records but no v=spf1 TXT record.",
                     "Publish an SPF TXT record listing the services allowed to "
                     "send mail for your domain.")
-            dmarc = _doh(f"_dmarc.{domain}", "TXT")
+            dmarc = _doh(f"_dmarc.{domain}", "TXT", timeout=timeout)
             dmarc_rec = next((t for t in dmarc if "v=dmarc1" in t.lower()), None)
             if not dmarc_rec:
                 add("dmarc-missing", "medium", "No DMARC record for a mail-receiving domain",
@@ -859,7 +910,7 @@ def _check_domain(host: str, add) -> None:
                     "but still delivered.",
                     "Once the DMARC reports look clean, step up to p=quarantine "
                     "and then p=reject so spoofed mail is actually blocked.")
-        caa = _doh(domain, "CAA")
+        caa = _doh(domain, "CAA", timeout=timeout)
         if not caa:
             add("caa-missing", "info", "No CAA record",
                 f"{domain} has no CAA records; any CA may issue certificates for it.",
@@ -1392,7 +1443,7 @@ def _check_db_ports(host: str, add, timeout: float = 2.5) -> list[int]:
     return open_ports
 
 
-def _check_tls(host: str, port: int, add) -> dict:
+def _check_tls(host: str, port: int, add, timeout: float = 10.0) -> dict:
     info: dict = {}
     try:
         # Verified handshake first: getpeercert() only returns the parsed
@@ -1400,7 +1451,7 @@ def _check_tls(host: str, port: int, add) -> dict:
         try:
             ctx = ssl.create_default_context()
             ctx.set_alpn_protocols(["h2", "http/1.1"])
-            with _tls_connect(host, port) as sock:
+            with _tls_connect(host, port, timeout=timeout) as sock:
                 with ctx.wrap_socket(sock, server_hostname=host) as tls_sock:
                     cert = tls_sock.getpeercert()
                     info["protocol"] = tls_sock.version()
@@ -1408,7 +1459,7 @@ def _check_tls(host: str, port: int, add) -> dict:
         except ssl.SSLCertVerificationError:
             ctx = ssl._create_unverified_context()
             ctx.set_alpn_protocols(["h2", "http/1.1"])
-            with _tls_connect(host, port) as sock:
+            with _tls_connect(host, port, timeout=timeout) as sock:
                 with ctx.wrap_socket(sock, server_hostname=host) as tls_sock:
                     info["protocol"] = tls_sock.version()
                     info["alpn"] = tls_sock.selected_alpn_protocol()

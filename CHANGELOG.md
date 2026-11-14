@@ -4,6 +4,37 @@ SiteVigil versions its audit ruleset separately (shown in every report
 and via `sitevigil --checks`) so results stay comparable over time and
 changes to what is checked are never silent.
 
+## 0.13.1 — ruleset 2026.11
+
+- Progress bar no longer leaves a stale `5/9` line in narrow terminals:
+  the rendered line is truncated to the terminal width and erased with
+  an ANSI clear-line sequence instead of 72 spaces. The phase-5 label
+  is the longest, so it was always the one left behind.
+- MCP `initialize` now reports the real package version instead of the
+  hardcoded `0.8.0`.
+- TLS and HTTP-to-HTTPS checks now target the host the audit actually
+  landed on (`final_url`), not the pre-redirect host.
+- HSTS without `max-age` is now flagged (`hsts-short`); previously a
+  present-but-useless HSTS header produced no finding.
+- `--crawl` sitemap-index handling now follows the first `.xml` child
+  instead of the first `<loc>` entry.
+- `no_proxy` matching now follows standard semantics: entries are
+  stripped, `*` matches everything, and a domain entry also matches
+  its subdomains.
+- MCP over HTTP no longer drops the request on a malformed
+  `Content-Length` or a non-string `url`: it answers a JSON-RPC error
+  instead.
+- `--timeout` now applies to the TLS handshake, database-port connects
+  (capped at 2.5 s per port), and DNS-over-HTTPS lookups, not only to
+  HTTP fetches.
+- A truncated chunked response body no longer crashes the audit: the
+  body reads as the bytes that actually arrived (caught live against
+  ednasalam.com, whose 404 for a probed path ends mid-body).
+- Test hygiene: fixture server sockets are closed in tearDown, so the
+  suite no longer emits a `ResourceWarning` per run.
+
+No new checks; catalog stays at 48.
+
 ## 0.13.0 — ruleset 2026.11
 
 - Probe mode choice: `--pentest safe|aggressive` (default safe). Safe

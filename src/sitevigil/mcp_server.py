@@ -6,6 +6,7 @@ which does not need an SDK for a single read-only tool.
 import json
 import sys
 
+from . import __version__
 from .audit import audit, generate_fix
 
 PROTOCOL = "2024-11-05"
@@ -41,7 +42,7 @@ def handle(msg: dict) -> dict | None:
     if method == "initialize":
         return {"protocolVersion": PROTOCOL,
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "sitevigil", "version": "0.8.0"}}
+                "serverInfo": {"name": "sitevigil", "version": __version__}}
     if method == "tools/list":
         return {"tools": TOOLS}
     if method == "tools/call":
@@ -50,7 +51,13 @@ def handle(msg: dict) -> dict | None:
         if name not in ("audit_site", "suggest_fix"):
             return {"content": [{"type": "text", "text": "unknown tool"}],
                     "isError": True}
-        report = audit((params.get("arguments") or {}).get("url", ""))
+        arguments = params.get("arguments") or {}
+        url = arguments.get("url", "") if isinstance(arguments, dict) else ""
+        if not isinstance(url, str) or not url:
+            return {"content": [{"type": "text",
+                                 "text": "tool arguments must include a url string"}],
+                    "isError": True}
+        report = audit(url)
         payload = report
         if name == "suggest_fix":
             payload = {"url": report.get("final_url") or report.get("url"),
@@ -89,7 +96,11 @@ def _make_http_server(host: str, port: int):
             if self.path != "/mcp":
                 self._send(404, b'{"error": "not found"}')
                 return
-            length = int(self.headers.get("Content-Length") or 0)
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                self._send(400, b'{"error": "invalid Content-Length"}')
+                return
             if length > 1_000_000:
                 self._send(413, b'{"error": "request too large"}')
                 return
@@ -100,7 +111,19 @@ def _make_http_server(host: str, port: int):
                     "jsonrpc": "2.0", "id": None,
                     "error": {"code": -32700, "message": "parse error"}}).encode())
                 return
-            result = handle(msg)
+            if not isinstance(msg, dict):
+                self._send(400, json.dumps({
+                    "jsonrpc": "2.0", "id": None,
+                    "error": {"code": -32600, "message": "request must be an object"}}).encode())
+                return
+            try:
+                result = handle(msg)
+            except Exception as e:  # a malformed call must not drop the request
+                self._send(200, json.dumps({
+                    "jsonrpc": "2.0", "id": msg.get("id"),
+                    "error": {"code": -32603,
+                              "message": f"internal error: {e}"}}).encode())
+                return
             if result is None or "id" not in msg:
                 self._send(202, b"")  # notification: accepted, no reply
                 return

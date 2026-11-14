@@ -3,6 +3,7 @@ import argparse
 import io
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
 from urllib.parse import urlparse
@@ -43,11 +44,18 @@ class _Progress:
         filled = int(self.WIDTH * done / total)
         bar = "█" * filled + "░" * (self.WIDTH - filled)
         frame = self.FRAMES[self.i % len(self.FRAMES)]
-        self.stream.write(f"\r{frame} [{bar}] {done}/{total} {label}... ")
+        line = f"{frame} [{bar}] {done}/{total} {label}... "
+        # Never let the line wrap: a wrapped line's first row can no
+        # longer be reached by \r, so it stays on screen forever (the
+        # phase-5 label is the longest, so it was always the one left
+        # behind in narrow terminals). \x1b[K clears to end of line so
+        # a shorter new line also erases the tail of a longer old one.
+        width = shutil.get_terminal_size(fallback=(80, 24)).columns
+        self.stream.write("\r" + line[:max(width - 1, 10)] + "\x1b[K")
         self.stream.flush()
 
     def finish(self):
-        self.stream.write("\r" + " " * 72 + "\r")
+        self.stream.write("\r\x1b[2K\r")
         self.stream.flush()
 
 

@@ -75,6 +75,16 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Location", hops[self.path])
             self.end_headers()
         elif self.path == "/sitemap.xml":
+            # sitemap INDEX: the first <loc> is a plain page, the child
+            # sitemap comes second -- discover_urls must follow the .xml
+            # child, not the first entry (v0.13.1 regression test)
+            host = self.headers.get("Host", "127.0.0.1")
+            xml = ("<?xml version='1.0'?><sitemapindex>"
+                   f"<sitemap><loc>http://{host}/page-first</loc></sitemap>"
+                   f"<sitemap><loc>http://{host}/child-sitemap.xml</loc></sitemap>"
+                   "</sitemapindex>")
+            self._send(200, xml.encode(), "application/xml")
+        elif self.path == "/child-sitemap.xml":
             host = self.headers.get("Host", "127.0.0.1")
             xml = ("<?xml version='1.0'?><urlset>"
                    f"<url><loc>http://{host}/</loc></url>"
@@ -111,6 +121,17 @@ class Handler(BaseHTTPRequestHandler):
             if any("SLEEP(" in v or "pg_sleep(" in v for v in vals):
                 time.sleep(5)  # blind injection point, no error leak
             self._send(200, INDEX, "text/html")
+        elif self.path in ("/truncated", "/truncated-ok"):
+            # chunked response that ends mid-body: one valid chunk, then
+            # the connection closes without the terminating zero chunk
+            code = 200 if self.path == "/truncated-ok" else 404
+            self.send_response(code)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            self.wfile.write(b"5\r\nhello\r\n")
+            self.wfile.flush()
+            self.close_connection = True
         elif self.path in Handler.uploads:
             self._send(200, Handler.uploads[self.path], "text/plain")
         elif self.path == "/":
@@ -193,6 +214,7 @@ class AuditTest(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.server.shutdown()
+        cls.server.server_close()  # shutdown() alone leaves the socket open
 
     def test_findings(self):
         report = audit(self.base)
@@ -339,6 +361,7 @@ class AuditTest(unittest.TestCase):
                 self.assertEqual(resp.status, 202)  # notification: no reply
         finally:
             server.shutdown()
+            server.server_close()  # shutdown() alone leaves the socket open
 
     def test_v09_latency_and_db_ports(self):
         import socket as sock
@@ -611,6 +634,138 @@ class AuditTest(unittest.TestCase):
                     mock.patch("urllib.request.urlopen",
                                side_effect=URLError("down")):
                 self.assertIsNone(_kev_lookup())
+
+
+    def test_v13_1_fixes(self):
+        import io
+        import os
+        from unittest import mock
+
+        import sitevigil.audit as audit_module
+        from sitevigil import __version__ as pkg_version
+        from sitevigil.audit import _check_domain, _check_hsts, _check_tls, _no_proxy_match
+        from sitevigil.cli import _Progress
+        from sitevigil.mcp_server import _make_http_server, handle as mcp_handle
+
+        # 1. progress bar never wraps: at 40 columns the line is cut
+        # short, and finish() erases with a clear-line sequence
+        buf = io.StringIO()
+        bar = _Progress(buf)
+        with mock.patch("sitevigil.cli.shutil.get_terminal_size",
+                        return_value=os.terminal_size((40, 24))):
+            bar("Cookies, CORS & exposed files", 5, 9)
+        line = buf.getvalue().split("\x1b[K")[0].lstrip("\r")
+        self.assertLessEqual(len(line), 39, line)
+        buf2 = io.StringIO()
+        _Progress(buf2).finish()
+        self.assertEqual(buf2.getvalue(), "\r\x1b[2K\r")
+
+        # 2. MCP initialize reports the real package version
+        init = mcp_handle({"method": "initialize"})
+        self.assertEqual(init["serverInfo"]["version"], pkg_version)
+
+        # 3. HSTS without max-age is flagged (the helper, direct: the
+        # fixture is HTTP-only so HSTS never runs in a live audit here)
+        seen: list = []
+        _check_hsts("includeSubDomains", lambda *a: seen.append(a[0]))
+        self.assertEqual(seen, ["hsts-short"])
+        seen.clear()
+        _check_hsts("max-age=100", lambda *a: seen.append(a[0]))
+        self.assertEqual(seen, ["hsts-short"])
+        seen.clear()
+        _check_hsts("max-age=31536000; includeSubDomains",
+                    lambda *a: seen.append(a[0]))
+        self.assertEqual(seen, ["hsts-preload"])
+        seen.clear()
+        _check_hsts(None, lambda *a: seen.append(a[0]))
+        self.assertEqual(seen, ["hsts-missing"])
+        seen.clear()
+        _check_hsts("max-age=31536000; includeSubDomains; preload",
+                    lambda *a: seen.append(a[0]))
+        self.assertEqual(seen, [])
+
+        # 4. sitemap index: the .xml child is followed even when the
+        # first <loc> is a plain page (the /sitemap.xml fixture is an
+        # index now; test_v05 asserts /page2 and /page3 too)
+        urls = discover_urls(self.base, limit=5)
+        self.assertTrue(any(u.endswith("/page3") for u in urls), urls)
+
+        # 5. no_proxy: exact, suffix, wildcard, stripped, case-insensitive
+        self.assertTrue(_no_proxy_match("api.example.com", "example.com"))
+        self.assertTrue(_no_proxy_match("example.com", "example.com"))
+        self.assertTrue(_no_proxy_match("anything.invalid", "*"))
+        self.assertTrue(_no_proxy_match("localhost", " localhost , example.com "))
+        self.assertTrue(_no_proxy_match("API.EXAMPLE.COM", "example.com"))
+        self.assertFalse(_no_proxy_match("api.example.com", "other.com"))
+        self.assertFalse(_no_proxy_match("example.com.evil.com", "example.com"))
+
+        # 6. MCP over HTTP: malformed requests get an error, not a drop
+        import http.client
+        server = _make_http_server("127.0.0.1", 0)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            conn = http.client.HTTPConnection(
+                "127.0.0.1", server.server_port, timeout=10)
+            conn.putrequest("POST", "/mcp")
+            conn.putheader("Content-Length", "abc")
+            conn.endheaders()
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 400)
+            resp.read()
+            body = json.dumps({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "audit_site",
+                           "arguments": {"url": 123}}}).encode()
+            conn.request("POST", "/mcp", body=body,
+                         headers={"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 200)
+            payload = json.loads(resp.read())
+            self.assertTrue(payload["result"]["isError"])
+            conn.request("POST", "/mcp", body=b"[1,2]",
+                         headers={"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 400)
+            resp.read()
+            conn.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        # 7. --timeout reaches TLS, DB ports (capped at 2.5 s) and DoH
+        seen_timeouts: list = []
+
+        def recording_tls_connect(host, port, timeout=10):
+            seen_timeouts.append(timeout)
+            raise OSError("down")
+
+        with mock.patch.object(audit_module, "_tls_connect",
+                               recording_tls_connect):
+            audit_module._check_tls("example.invalid", 443,
+                                    lambda *a: None, timeout=7.5)
+            self.assertEqual(seen_timeouts, [7.5])
+            seen_timeouts.clear()
+            audit(self.base, timeout=10)  # http fixture: only DB ports use it
+            self.assertEqual(set(seen_timeouts), {2.5})
+        doh_timeouts: list = []
+
+        def recording_doh(name, rtype, timeout=5.0):
+            doh_timeouts.append(timeout)
+            return []
+
+        with mock.patch.object(audit_module, "_doh", recording_doh):
+            _check_domain("example.com", lambda *a: None, timeout=4.0)
+        self.assertEqual(set(doh_timeouts), {4.0})
+
+        # 8. truncated chunked body (live crash against ednasalam.com):
+        # _fetch returns the partial body instead of raising
+        from sitevigil.audit import _fetch
+        status, _h, body, _u = _fetch(self.base + "/truncated", 5)
+        self.assertEqual(status, 404)
+        self.assertEqual(body, b"hello")
+        status, _h, body, _u = _fetch(self.base + "/truncated-ok", 5)
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"hello")
 
 
 if __name__ == "__main__":
