@@ -4,6 +4,50 @@ SiteVigil versions its audit ruleset separately (shown in every report
 and via `sitevigil --checks`) so results stay comparable over time and
 changes to what is checked are never silent.
 
+## 0.13.0 — ruleset 2026.11
+
+- Probe mode choice: `--pentest safe|aggressive` (default safe). Safe
+  mode is the read-only probes from 0.12.0. Aggressive mode adds two
+  confirmation probes: a time-delay blind SQL injection check
+  (`SLEEP()`/`pg_sleep()`, fires only on a >= 4 s delay against a
+  measured baseline, skipped when the error probe already proved the
+  injection point) and a PUT canary file, written and then deleted
+  immediately (only when OPTIONS already advertised PUT; if the
+  delete fails the finding names the file left behind). The report
+  records `pentest_mode` (`safe`, `aggressive`, or `off`).
+- Aggressive mode prints a warning on stderr and is opt-in only: it
+  sends write and time-delay payloads, so it must run solely against
+  systems you own or have written permission to test. Catalog 46 -> 48
+  checks.
+
+## 0.12.0 — ruleset 2026.11
+
+- Active input probes (new phase 9, catalog 42 -> 46 checks): reflected
+  XSS (unique canary in a query parameter, the URL path, and `q`),
+  open redirect (`next`/`url`/`redirect`/`return`/`target`/`continue`
+  to an external domain), SQL error messages (stray quote, matched
+  against known database error strings), and dangerous HTTP methods
+  (PUT/DELETE in the OPTIONS Allow header, WebDAV detection).
+  `--no-probes` turns them off.
+- Probes are non-destructive by design: they send crafted input and
+  read the response only. No PUT is ever sent, nothing is written or
+  deleted, no login is attempted, no data is extracted. A probe that
+  errors or times out is skipped silently and never fails the audit.
+
+## 0.11.0 — ruleset 2026.11
+
+- CISA Known Exploited Vulnerabilities cross-check: every CVE matched
+  from NVD is checked against the CISA KEV catalog (fetched once per
+  audit, cached on disk for 24 hours next to the NVD cache). A CVE that
+  CISA lists as exploited in the wild is tagged `KNOWN EXPLOITED (CISA
+  KEV, added YYYY-MM-DD)` in the finding title, carries `kev: true` and
+  `kev_date_added` in machine output, and its detail says to patch it
+  first. `--no-kev` turns the cross-check off. Scoring is unchanged: a
+  KEV tag marks priority, it does not change the score.
+- A missing KEV tag is not a clean bill of health: if the CISA feed is
+  unreachable the tag is simply absent (same as an unreachable NVD
+  means no CVE section), and the audit never fails over it.
+
 ## 0.10.0 — ruleset 2026.11
 
 - Colour in the terminal: severity tags, score and grade are coloured

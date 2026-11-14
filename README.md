@@ -62,9 +62,10 @@ Fair question — sites like SecurityHeaders or Mozilla Observatory grade a page
 | Exposed services | Database ports open to the internet — MySQL/MariaDB (3306), PostgreSQL (5432), Redis (6379), MongoDB (27017), plain TCP connect |
 | Page content | Mixed content (HTTP subresources on an HTTPS page), cross-origin scripts without Subresource Integrity |
 | Methods & discovery | HTTP TRACE enabled, missing `/.well-known/security.txt` |
+| Active probes | Reflected XSS canary, open-redirect parameters, SQL error messages, PUT/DELETE in OPTIONS Allow — read-only in safe mode (default). `--pentest aggressive` adds a time-delay blind SQLi check and a PUT canary file, written then deleted; run only against systems you own or have written permission to test |
 | Isolation | Cross-Origin-Opener-Policy, Cross-Origin-Resource-Policy, CSP hardening directives (object-src / base-uri) |
 | Domain (via DNS) | SPF and DMARC (only when the domain receives mail), CAA |
-| Known vulnerabilities | Software/version fingerprints (nginx, Apache, PHP, OpenSSL, IIS, WordPress, Drupal, Joomla) matched against NVD CVEs, verified against each CVE's vulnerable version ranges — plus jQuery and WordPress plugins (Elementor, WooCommerce, Contact Form 7, Akismet) fingerprinted from the page source |
+| Known vulnerabilities | Software/version fingerprints (nginx, Apache, PHP, OpenSSL, IIS, WordPress, Drupal, Joomla) matched against NVD CVEs, verified against each CVE's vulnerable version ranges — plus jQuery and WordPress plugins (Elementor, WooCommerce, Contact Form 7, Akismet) fingerprinted from the page source. Every match is cross-checked against the CISA Known Exploited Vulnerabilities catalog and tagged `KNOWN EXPLOITED` when CISA lists it as exploited in the wild |
 | Info disclosure | `Server`, `X-Powered-By` |
 
 The full catalog — 30+ checks, each with its reference — is one command away: `sitevigil --checks`. Checks are versioned as a **ruleset** (currently `2026.11`); every report names the ruleset that produced it, and changes land in [CHANGELOG.md](CHANGELOG.md), never silently. To keep a site up to date automatically, drop in the weekly GitHub Action from [examples/github-action](examples/github-action/sitevigil-weekly.yml): it re-audits on a schedule and fails on score drops or regressions.
@@ -104,6 +105,9 @@ sitevigil example.com --baseline monday.json        # next week: what regressed?
 sitevigil example.com --crawl 10                    # audit up to 10 pages (sitemap.xml, else homepage links)
 sitevigil example.com --badge > badge.svg           # an SVG score badge for your README
 sitevigil example.com --no-cve                      # skip the CVE lookup (faster, fully offline)
+sitevigil example.com --no-kev                      # skip the CISA KEV cross-check (no KNOWN EXPLOITED tags)
+sitevigil example.com --no-probes                   # skip the active input probes
+sitevigil example.com --pentest aggressive          # aggressive probes (blind SQLi timing + PUT canary); authorized targets only
 sitevigil example.com --no-ports                    # skip the exposed-database-port check
 sitevigil example.com --html --output report.html   # write any format straight to a file
 ```

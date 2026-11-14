@@ -13,6 +13,7 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
@@ -33,13 +34,38 @@ INDEX = (b'<html><body>spa index <a href="/page2">two</a>'
 class Handler(BaseHTTPRequestHandler):
     server_version = "Apache/2.4.49"  # versioned banner -> CVE fingerprint
     sys_version = ""
+    uploads: dict = {}  # path -> body, written by do_PUT, read by do_GET
 
     def log_message(self, *a):
         pass
 
+    def do_PUT(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        Handler.uploads[self.path] = self.rfile.read(length)
+        self.send_response(201)
+        self.end_headers()
+
+    def do_DELETE(self):
+        if self.path in Handler.uploads:
+            del Handler.uploads[self.path]
+            self.send_response(200)
+        else:
+            self.send_response(404)
+        self.end_headers()
+
     def do_TRACE(self):
         body = ("\r\n".join(f"{k}: {v}" for k, v in self.headers.items())).encode()
         self._send(200, body, "message/http")
+
+    def do_OPTIONS(self):
+        if self.path == "/dav":
+            self.send_response(200)
+            self.send_header("Allow", "GET, HEAD, OPTIONS, PUT, DELETE")
+            self.send_header("DAV", "1")
+        else:
+            self.send_response(200)
+            self.send_header("Allow", "GET, HEAD, OPTIONS")
+        self.end_headers()
 
     def do_GET(self):
         hops = {"/hop1": "/hop2", "/hop2": "/hop3", "/hop3": "/hop4",
@@ -57,6 +83,36 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, xml.encode(), "application/xml")
         elif self.path == "/.env":
             self._send(200, b"API_KEY=abc123\nDB_PASSWORD=hunter2\n", "text/plain")
+        elif urlsplit(self.path).path == "/echo":
+            q = parse_qs(urlsplit(self.path).query)
+            value = (q.get("svxss") or q.get("q") or [""])[0]
+            body = ("<html><body>results for " + value + "</body></html>").encode()
+            self._send(200, body, "text/html")
+        elif urlsplit(self.path).path == "/redir":
+            q = parse_qs(urlsplit(self.path).query)
+            target = (q.get("next") or [None])[0]
+            if target:
+                self.send_response(302)
+                self.send_header("Location", target)
+                self.end_headers()
+            else:
+                self._send(200, INDEX, "text/html")
+        elif urlsplit(self.path).path == "/db":
+            if "%27" in self.path or "'" in self.path:
+                self._send(200, b"You have an error in your SQL syntax; "
+                            b"check the manual that corresponds to your "
+                            b"MySQL server version", "text/html")
+            else:
+                self._send(200, INDEX, "text/html")
+        elif urlsplit(self.path).path == "/dbblind":
+            import time
+            vals = [v for vs in
+                    parse_qs(urlsplit(self.path).query).values() for v in vs]
+            if any("SLEEP(" in v or "pg_sleep(" in v for v in vals):
+                time.sleep(5)  # blind injection point, no error leak
+            self._send(200, INDEX, "text/html")
+        elif self.path in Handler.uploads:
+            self._send(200, Handler.uploads[self.path], "text/plain")
         elif self.path == "/":
             self.send_response(200)
             self.send_header("Set-Cookie", "sessionid=xyz; Path=/")
@@ -127,6 +183,9 @@ class AuditTest(unittest.TestCase):
         import sitevigil.audit as audit_module
         os.environ["SITEVIGIL_CACHE_DIR"] = tempfile.mkdtemp()
         audit_module._nvd_query = _canned_nvd  # tests never touch real NVD
+        # CVE-2021-41773 is in the real KEV catalog; jQuery's is not.
+        cls._kev_lookup_real = audit_module._kev_lookup
+        audit_module._kev_lookup = lambda: {"CVE-2021-41773": "2021-11-03"}
         cls.server = HTTPServer(("127.0.0.1", 0), Handler)
         threading.Thread(target=cls.server.serve_forever, daemon=True).start()
         cls.base = f"http://127.0.0.1:{cls.server.server_port}"
@@ -391,6 +450,79 @@ class AuditTest(unittest.TestCase):
         self.assertIn("Response", page)
         self.assertNotIn("background:#eaeef2", page)  # old light theme
 
+    def test_v12_probes(self):
+        # reflected XSS: /echo returns the raw query value
+        echo = audit(self.base + "/echo")
+        xss = [f for f in echo["findings"] if f["id"] == "xss-reflected"]
+        self.assertEqual(len(xss), 1, echo["findings"])
+        self.assertEqual(xss[0]["severity"], "high")
+        # open redirect: /redir 302s to the next parameter
+        redir = audit(self.base + "/redir")
+        od = [f for f in redir["findings"] if f["id"] == "open-redirect"]
+        self.assertEqual(len(od), 1, redir["findings"])
+        self.assertEqual(od[0]["severity"], "medium")
+        # SQL error: /db leaks a MySQL error on a stray quote
+        db = audit(self.base + "/db?id=1")
+        sq = [f for f in db["findings"] if f["id"] == "sqli-error"]
+        self.assertEqual(len(sq), 1, db["findings"])
+        self.assertEqual(sq[0]["severity"], "high")
+        # dangerous methods: /dav advertises PUT and DELETE
+        dav = audit(self.base + "/dav")
+        dm = [f for f in dav["findings"]
+              if f["id"] == "http-methods-dangerous"]
+        self.assertEqual(len(dm), 1, dav["findings"])
+        self.assertEqual(dm[0]["severity"], "medium")
+        # the plain index triggers none of the four
+        plain = audit(self.base)
+        self.assertFalse(any(f["id"] in ("xss-reflected", "open-redirect",
+                                         "sqli-error", "http-methods-dangerous")
+                            for f in plain["findings"]))
+        # opt-out removes every probe
+        off = audit(self.base + "/echo", probes=False)
+        self.assertFalse(any(f["id"] == "xss-reflected"
+                             for f in off["findings"]))
+        # the catalog grew by four (plus two aggressive checks: 48 total)
+        from sitevigil.audit import CHECKS
+        self.assertEqual(len(CHECKS), 48)
+
+    def test_v13_aggressive(self):
+        # blind SQLi: /dbblind sleeps 5 s on SLEEP(), leaks nothing else
+        safe = audit(self.base + "/dbblind?id=1")
+        self.assertEqual(safe["pentest_mode"], "safe")
+        self.assertFalse(any(f["id"] == "sqli-blind"
+                             for f in safe["findings"]))
+        aggr = audit(self.base + "/dbblind?id=1", pentest="aggressive")
+        self.assertEqual(aggr["pentest_mode"], "aggressive")
+        blind = [f for f in aggr["findings"] if f["id"] == "sqli-blind"]
+        self.assertEqual(len(blind), 1, aggr["findings"])
+        self.assertEqual(blind[0]["severity"], "high")
+        # ...but never when the error probe already proved the point
+        db = audit(self.base + "/db?id=1", pentest="aggressive")
+        self.assertTrue(any(f["id"] == "sqli-error"
+                            for f in db["findings"]))
+        self.assertFalse(any(f["id"] == "sqli-blind"
+                             for f in db["findings"]))
+        # PUT canary: /dav accepts the file, the audit deletes it again
+        Handler.uploads.clear()
+        dav = audit(self.base + "/dav", pentest="aggressive")
+        put = [f for f in dav["findings"] if f["id"] == "http-put-write"]
+        self.assertEqual(len(put), 1, dav["findings"])
+        self.assertEqual(put[0]["severity"], "critical")
+        self.assertIn("file removed", put[0]["detail"])
+        self.assertEqual(Handler.uploads, {})
+        # safe mode on /dav: methods only, no canary ever written
+        Handler.uploads.clear()
+        dav_safe = audit(self.base + "/dav")
+        self.assertFalse(any(f["id"] == "http-put-write"
+                             for f in dav_safe["findings"]))
+        self.assertEqual(Handler.uploads, {})
+        # aggressive on a clean page: nothing fires, mode still recorded
+        plain = audit(self.base, pentest="aggressive")
+        self.assertFalse(any(f["id"] in ("sqli-blind", "http-put-write")
+                            for f in plain["findings"]))
+        off = audit(self.base + "/dbblind?id=1", probes=False)
+        self.assertEqual(off["pentest_mode"], "off")
+
     def test_banner(self):
         import contextlib
         import io
@@ -415,6 +547,70 @@ class AuditTest(unittest.TestCase):
             "name": "audit_site", "arguments": {"url": self.base}}})
         parsed = json.loads(out["content"][0]["text"])
         self.assertIn("score", parsed)
+
+    def test_v11_kev(self):
+        report = audit(self.base)
+        apache = [f for f in report["findings"] if f["id"] == "cve-2021-41773"]
+        self.assertEqual(len(apache), 1)
+        self.assertTrue(apache[0].get("kev"))
+        self.assertEqual(apache[0].get("kev_date_added"), "2021-11-03")
+        self.assertIn("KNOWN EXPLOITED", apache[0]["title"])
+        self.assertIn("CISA", apache[0]["detail"])
+        # a CVE outside KEV stays untagged
+        jq = [f for f in report["findings"] if f["id"] == "cve-2020-11023"]
+        self.assertEqual(len(jq), 1)
+        self.assertNotIn("kev", jq[0])
+        # opt-out removes every tag
+        off = audit(self.base, kev=False)
+        self.assertFalse(any(f.get("kev") for f in off["findings"]))
+        # a failed KEV feed must not fail or falsify the audit
+        import sitevigil.audit as audit_module
+        old = audit_module._kev_lookup
+        audit_module._kev_lookup = lambda: None
+        try:
+            report2 = audit(self.base)
+        finally:
+            audit_module._kev_lookup = old
+        self.assertTrue(any(f["id"] == "cve-2021-41773"
+                            for f in report2["findings"]))
+        self.assertFalse(any(f.get("kev") for f in report2["findings"]))
+
+    def test_v11_kev_lookup(self):
+        import os
+        import tempfile
+        from unittest import mock
+        from urllib.error import URLError
+
+        # setUpClass stubbed the module name; the real function is on the
+        # class (via the class, not the instance, so it stays unbound)
+        _kev_lookup = type(self)._kev_lookup_real
+        feed = {"vulnerabilities": [
+            {"cveID": "CVE-2021-41773", "dateAdded": "2021-11-03"},
+            {"cveID": "CVE-2020-11023", "dateAdded": "2020-07-28"}]}
+        resp = mock.MagicMock()
+        resp.read.return_value = json.dumps(feed).encode()
+        resp.__enter__.return_value = resp
+        with tempfile.TemporaryDirectory() as td:
+            env = {"SITEVIGIL_CACHE_DIR": td}
+            with mock.patch.dict(os.environ, env), \
+                    mock.patch("urllib.request.urlopen",
+                               return_value=resp) as get:
+                self.assertEqual(_kev_lookup(), {
+                    "CVE-2021-41773": "2021-11-03",
+                    "CVE-2020-11023": "2020-07-28"})
+                self.assertTrue(os.path.exists(
+                    os.path.join(td, "kev.json")))
+                # second call reads the cache: the feed is not re-fetched
+                get.side_effect = URLError("down")
+                self.assertEqual(_kev_lookup(), {
+                    "CVE-2021-41773": "2021-11-03",
+                    "CVE-2020-11023": "2020-07-28"})
+            # no cache and a dead feed -> None, never an exception
+            with tempfile.TemporaryDirectory() as td2, \
+                    mock.patch.dict(os.environ, {"SITEVIGIL_CACHE_DIR": td2}), \
+                    mock.patch("urllib.request.urlopen",
+                               side_effect=URLError("down")):
+                self.assertIsNone(_kev_lookup())
 
 
 if __name__ == "__main__":

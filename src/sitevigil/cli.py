@@ -87,6 +87,20 @@ def main(argv=None) -> int:
     parser.add_argument("--no-cve", action="store_true",
                         help="Skip the known-vulnerability (CVE) lookup "
                              "against NVD (faster, fully offline)")
+    parser.add_argument("--no-kev", action="store_true",
+                        help="Skip the CISA Known Exploited Vulnerabilities "
+                             "cross-check (no KNOWN EXPLOITED tags on CVE "
+                             "findings)")
+    parser.add_argument("--no-probes", action="store_true",
+                        help="Skip the active input probes (reflected XSS, "
+                             "open redirect, SQL error, dangerous methods)")
+    parser.add_argument("--pentest", choices=("safe", "aggressive"),
+                        default="safe",
+                        help="Probe mode: safe (default, read-only probes) "
+                             "or aggressive (adds a time-delay blind SQLi "
+                             "check and a PUT canary file, written then "
+                             "deleted; run only against systems you own or "
+                             "have written permission to test)")
     parser.add_argument("--no-ports", action="store_true",
                         help="Skip the exposed-database-port check "
                              "(TCP connect to MySQL/PostgreSQL/Redis/MongoDB ports)")
@@ -122,6 +136,12 @@ def main(argv=None) -> int:
     if not args.urls:
         parser.error("at least one url is required (or use --mcp / --checks)")
 
+    if args.pentest == "aggressive":
+        print("warning: aggressive pentest mode sends write and time-delay "
+              "payloads (a PUT canary file, written then deleted, and a "
+              "SLEEP() probe) -- run only against systems you own or have "
+              "written permission to test", file=sys.stderr)
+
     if args.crawl:
         if len(args.urls) != 1:
             parser.error("--crawl works with exactly one url")
@@ -145,7 +165,9 @@ def main(argv=None) -> int:
         host = urlparse(u if "://" in u else f"https://{u}").hostname or ""
         reports.append(audit(u, timeout=args.timeout, cve=not args.no_cve,
                              ports=not args.no_ports and host not in seen_hosts,
-                             progress=progress))
+                             progress=progress, kev=not args.no_kev,
+                             probes=not args.no_probes,
+                             pentest=args.pentest))
         seen_hosts.add(host)
     if progress is not None:
         progress.finish()

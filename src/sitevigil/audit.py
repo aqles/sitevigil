@@ -76,6 +76,12 @@ CHECKS = [
     ("cve-overflow", "info", "Total known-CVE count when more than 10 match a version", "https://nvd.nist.gov/"),
     ("slow-response", "low", "Main page responds within 3 seconds", "https://developer.mozilla.org/en-US/docs/Web/Performance"),
     ("db-port-exposed", "high", "Database ports (MySQL/PostgreSQL/Redis/MongoDB) are not open to the internet", "https://owasp.org/www-project-web-security-testing-guide/"),
+    ("xss-reflected", "high", "User input is not reflected unencoded (reflected XSS probe)", "https://owasp.org/www-community/attacks/xss/"),
+    ("open-redirect", "medium", "Redirect parameters do not point outside the site", "https://cheatsheetseries.owasp.org/cheatsheets/Unvalidated_Redirects_and_Forwards_Cheat_Sheet.html"),
+    ("sqli-error", "high", "Crafted input does not leak database errors", "https://owasp.org/www-community/attacks/SQL_Injection"),
+    ("http-methods-dangerous", "medium", "PUT / DELETE are not advertised (OPTIONS Allow)", "https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Methods/PUT"),
+    ("sqli-blind", "high", "Time-delay SQL injection does not fire (aggressive mode only)", "https://owasp.org/www-community/attacks/Blind_SQL_Injection"),
+    ("http-put-write", "critical", "PUT cannot write a file to the web root (aggressive mode only)", "https://owasp.org/www-project-web-security-testing-guide/"),
 ]
 
 # Latency budget for the main document fetch, and the well-known database
@@ -89,7 +95,8 @@ DB_PORTS = {3306: "MySQL/MariaDB", 5432: "PostgreSQL",
 # library and MCP callers simply pass nothing and get no output.
 AUDIT_PHASES = ["Fetching page", "Redirect chain", "TLS certificate",
                 "Security headers", "Cookies, CORS & exposed files",
-                "DNS records", "CVE lookup (NVD)", "Database ports"]
+                "DNS records", "CVE lookup (NVD)", "Database ports",
+                "Active probes"]
 
 # ANSI colours for terminal output. Stdlib only, no colour library.
 _ANSI = {"reset": "\x1b[0m", "bold": "\x1b[1m", "dim": "\x1b[2m",
@@ -115,10 +122,11 @@ class _NoRedirect(HTTPRedirectHandler):
 
 
 def _fetch(url: str, timeout: float, headers: dict | None = None,
-           follow: bool = True, method: str = "GET"):
+           follow: bool = True, method: str = "GET",
+           data: bytes | None = None):
     """Return (status, headers-as-dict-of-lists, body-bytes, final_url)."""
     req = Request(url, headers={"User-Agent": USER_AGENT, **(headers or {})},
-                  method=method)
+                  method=method, data=data)
     opener = build_opener() if follow else build_opener(_NoRedirect)
     try:
         with opener.open(req, timeout=timeout) as resp:
@@ -296,15 +304,19 @@ class _PageParser(HTMLParser):
 
 
 def audit(raw_url: str, timeout: float = 10.0, cve: bool = True,
-          ports: bool = True, progress=None) -> dict:
+          ports: bool = True, progress=None, kev: bool = True,
+          probes: bool = True, pentest: str = "safe") -> dict:
     url = raw_url if "://" in raw_url else f"https://{raw_url}"
     parsed = urlparse(url)
     host = parsed.hostname or ""
     findings: list[dict] = []
 
-    def add(fid, severity, title, detail, fix):
-        findings.append({"id": fid, "severity": severity, "title": title,
-                         "detail": detail, "fix": fix})
+    def add(fid, severity, title, detail, fix, extra=None):
+        finding = {"id": fid, "severity": severity, "title": title,
+                   "detail": detail, "fix": fix}
+        if extra:
+            finding.update(extra)
+        findings.append(finding)
 
     def step(n: int) -> None:
         if progress is not None:
@@ -583,6 +595,7 @@ def audit(raw_url: str, timeout: float = 10.0, cve: bool = True,
     body_text = body.decode("utf-8", errors="ignore") if body else ""
     software = _fingerprints(headers, body_text)
     if cve:
+        kev_map = _kev_lookup() if (kev and software) else None
         for fp in software:
             hits = _cve_lookup(fp["product"], fp["version"])
             if not hits:
@@ -592,16 +605,28 @@ def audit(raw_url: str, timeout: float = 10.0, cve: bool = True,
                 severity = ("critical" if cvss is not None and cvss >= 9 else
                             "high" if cvss is not None and cvss >= 7 else
                             "medium" if cvss is not None and cvss >= 4 else "low")
-                add(hit["id"].lower(), severity,
-                    f"{fp['name']} {fp['version']} is affected by {hit['id']}"
-                    + (f" (CVSS {cvss})" if cvss is not None else ""),
-                    f"Detected via {fp['via']}. {hit['description']} "
-                    "Fingerprint-based match: distributions sometimes backport "
-                    "security fixes without changing the version string, so "
-                    "confirm against your package changelog.",
+                kev_date = kev_map.get(hit["id"]) if kev_map else None
+                title = (f"{fp['name']} {fp['version']} is affected by "
+                         f"{hit['id']}"
+                         + (f" (CVSS {cvss})" if cvss is not None else ""))
+                detail = (f"Detected via {fp['via']}. {hit['description']} "
+                          "Fingerprint-based match: distributions sometimes "
+                          "backport security fixes without changing the "
+                          "version string, so confirm against your package "
+                          "changelog.")
+                extra = None
+                if kev_date:
+                    title += (f" — KNOWN EXPLOITED (CISA KEV, added "
+                              f"{kev_date})")
+                    detail = (f"CISA lists {hit['id']} as known exploited "
+                              f"in the wild (added to the KEV catalog "
+                              f"{kev_date}). Patch this one first. " + detail)
+                    extra = {"kev": True, "kev_date_added": kev_date}
+                add(hit["id"].lower(), severity, title, detail,
                     f"Upgrade {fp['name']} to a release where {hit['id']} is "
                     f"fixed (https://nvd.nist.gov/vuln/detail/{hit['id']}), "
-                    "or verify your distribution backported the patch.")
+                    "or verify your distribution backported the patch.",
+                    extra=extra)
             if len(hits) > 10:
                 add("cve-overflow", "info",
                     f"{fp['name']} {fp['version']} has {len(hits)} known CVEs",
@@ -618,6 +643,11 @@ def audit(raw_url: str, timeout: float = 10.0, cve: bool = True,
         open_db_ports = _check_db_ports(host, add)
     step(8)
 
+    # --- Active probes (non-destructive input tests) ---------------------
+    if probes:
+        _active_probes(final_url, timeout, add, pentest)
+    step(9)
+
     score = max(0, 100 - sum(WEIGHTS[f["severity"]] for f in findings))
     grade = ("A" if score >= 90 else "B" if score >= 80 else
              "C" if score >= 65 else "D" if score >= 50 else "F")
@@ -627,6 +657,7 @@ def audit(raw_url: str, timeout: float = 10.0, cve: bool = True,
             "response_time_ms": response_ms, "open_db_ports": open_db_ports,
             "software": software,
             "tls": tls, "score": score, "grade": grade,
+            "pentest_mode": pentest if probes else "off",
             "findings": findings}
 
 
@@ -1062,6 +1093,270 @@ def _cve_lookup(product_key: str, version: str) -> list[dict] | None:
     except Exception:
         pass
     return out
+
+
+_KEV_FEED = ("https://www.cisa.gov/sites/default/files/feeds/"
+              "known_exploited_vulnerabilities.json")
+
+
+def _kev_lookup() -> dict[str, str] | None:
+    """CVE ID -> KEV dateAdded, cached on disk for 24 hours.
+
+    Returns None when the CISA feed is unreachable -- the audit then
+    simply has no KEV tags, same as an unreachable NVD means no CVE
+    section. A missing tag must never be read as "not exploited".
+    """
+    import os
+    import time
+    from urllib.request import urlopen
+
+    cache_dir = os.environ.get("SITEVIGIL_CACHE_DIR") or os.path.join(
+        os.path.expanduser("~"), ".cache", "sitevigil")
+    path = os.path.join(cache_dir, "kev.json")
+    try:
+        if os.path.exists(path) and time.time() - os.path.getmtime(path) < 86400:
+            with open(path, encoding="utf-8") as fh:
+                return json.load(fh)["kev"]
+    except Exception:
+        pass
+    try:
+        req = Request(_KEV_FEED, headers={"User-Agent": USER_AGENT})
+        with urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read())
+        out = {v["cveID"]: v["dateAdded"]
+               for v in data.get("vulnerabilities", [])
+               if v.get("cveID") and v.get("dateAdded")}
+    except Exception:
+        return None
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"kev": out}, fh)
+    except Exception:
+        pass
+    return out
+
+
+# Probes that send crafted input and read the response: they never write,
+# delete, log in, or extract data from the target. A probe that errors or
+# times out is skipped silently -- a failed probe must never fail the audit.
+_SQL_ERRORS = (
+    "you have an error in your sql syntax", "warning: mysql_",
+    "ora-01756", "ora-00933", "quoted string not properly terminated",
+    "unclosed quotation mark", "microsoft ole db", "odbc sql server",
+    "warning: pg_", "sqlite",
+)
+_REDIRECT_PARAMS = ("next", "url", "redirect", "return", "target", "continue")
+
+
+def _with_param(base: str, name: str, value: str) -> str:
+    from urllib.parse import parse_qsl, urlencode
+
+    p = urlparse(base)
+    q = dict(parse_qsl(p.query, keep_blank_values=True))
+    q[name] = value
+    return p._replace(query=urlencode(q)).geturl()
+
+
+def _active_probes(base_url: str, timeout: float, add,
+                   pentest: str = "safe") -> None:
+    """Input probes. Safe mode is non-destructive: reflected XSS, open
+    redirect, SQL error messages, dangerous HTTP methods. Aggressive
+    mode adds two confirmation probes that touch the target harder --
+    a time-delay blind SQL injection check and a canary file written
+    with PUT and deleted again. Aggressive mode is opt-in only: run it
+    solely against systems you own or have written permission to test.
+    Each probe stops at the first hit; a probe that errors or times
+    out is skipped silently and never fails the audit.
+    """
+    import secrets
+    import time
+    from urllib.parse import parse_qsl, quote, urlencode
+
+    put_allowed = False
+    sqli_found = False
+
+    # --- Dangerous methods: does OPTIONS advertise PUT or DELETE? -------
+    # Read-only: the Allow header is the evidence. No PUT is ever sent
+    # in safe mode, so nothing is written to the target.
+    try:
+        status, headers, _, _ = _fetch(base_url, timeout, method="OPTIONS",
+                                       follow=False)
+        allow = {m.strip() for m in (_first(headers, "allow") or "").split(",")}
+        dangerous = sorted(m for m in ("PUT", "DELETE") if m in allow)
+        put_allowed = "PUT" in allow
+        dav = _first(headers, "dav")
+        if dangerous or dav:
+            add("http-methods-dangerous", "medium",
+                "PUT or DELETE advertised by the server",
+                f"OPTIONS on {base_url} advertises: "
+                f"{', '.join(sorted(allow)) or '(no Allow header)'}"
+                + (f"; WebDAV enabled ({dav})" if dav else "") +
+                ". A writable method on a public site is a foothold: "
+                "uploaded files have led to full compromise.",
+                "Disable PUT and DELETE (and WebDAV) unless the application "
+                "genuinely needs them; restrict any upload endpoint to "
+                "authenticated users and a safe directory.")
+    except Exception:
+        pass
+
+    # --- Reflected XSS: is our canary echoed back unencoded? -----------
+    canary = "svx" + secrets.token_hex(4) + "\"><'"
+    try:
+        for probe_url in (_with_param(base_url, "svxss", canary),
+                          urljoin(base_url, "/" + quote(canary, safe="")),
+                          _with_param(base_url, "q", canary)):
+            try:
+                _, _, body, _ = _fetch(probe_url, timeout)
+            except Exception:
+                continue
+            text = body.decode("utf-8", errors="ignore")
+            at = text.find(canary)
+            if at < 0:
+                continue
+            snippet = " ".join(text[max(0, at - 40):at + len(canary) + 40].split())
+            add("xss-reflected", "high",
+                "User input is reflected unencoded in the page",
+                f"The probe string {canary!r} came back verbatim in the "
+                f"response: ...{snippet}... Unencoded reflection of "
+                f"\"><' means an attacker can break out of the surrounding "
+                "markup; confirm exploitability in that context, but treat "
+                "any raw reflection as a real hole.",
+                "Encode all user-controlled output for its context "
+                "(HTML-encode in markup, attribute-encode in attributes); "
+                "enforce a Content-Security-Policy as defence in depth.")
+            break
+    except Exception:
+        pass
+
+    # --- Open redirect: does a redirect parameter point outside? --------
+    try:
+        for name in _REDIRECT_PARAMS:
+            probe_url = _with_param(base_url, name, "https://example.com")
+            try:
+                status, headers, _, _ = _fetch(probe_url, timeout, follow=False)
+            except Exception:
+                continue
+            if status not in (301, 302, 303, 307, 308):
+                continue
+            target = _first(headers, "location") or ""
+            if urlparse(target).netloc == "example.com":
+                add("open-redirect", "medium",
+                    f"Open redirect via the {name!r} parameter",
+                    f"{probe_url} answers {status} to https://example.com. "
+                    "An attacker can use the site's own domain to send "
+                    "victims to a phishing page.",
+                    "Allow only relative redirect targets or an explicit "
+                    "allow-list of destinations; never redirect to a "
+                    "raw user-supplied URL.")
+                break
+    except Exception:
+        pass
+
+    # --- SQL error: does a stray quote leak a database error? -----------
+    try:
+        p = urlparse(base_url)
+        q = dict(parse_qsl(p.query, keep_blank_values=True))
+        if q:
+            first = next(iter(q))
+            q[first] = q[first] + "'"
+            probe_url = p._replace(query=urlencode(q)).geturl()
+        else:
+            probe_url = _with_param(base_url, "svsql", "1'")
+        _, _, body, _ = _fetch(probe_url, timeout)
+        text = body.decode("utf-8", errors="ignore").lower()
+        hit = next((s for s in _SQL_ERRORS if s in text), None)
+        if hit:
+            sqli_found = True
+            add("sqli-error", "high",
+                "Database error message leaks from crafted input",
+                f"A single quote in the request produced a database error "
+                f"mentioning {hit!r}. The input reaches the database "
+                "unsanitized: an error message alone does not prove data "
+                "can be extracted, but it proves the injection point is "
+                "real and tells the attacker which database runs behind it.",
+                "Use parameterised queries (prepared statements) everywhere "
+                "user input reaches SQL; turn database error details off "
+                "in production responses.")
+    except Exception:
+        pass
+
+    if pentest != "aggressive":
+        return
+
+    # --- Blind SQLi (aggressive): does a SLEEP payload delay the reply?
+    # Skipped when the error probe already proved the injection point:
+    # a second confirmation buys nothing and costs a 5 s database sleep.
+    if not sqli_found:
+        try:
+            p = urlparse(base_url)
+            q = dict(parse_qsl(p.query, keep_blank_values=True))
+            base_q = dict(q)
+            if q:
+                first = next(iter(q))
+            else:
+                first = "svsql"
+                base_q[first] = "1"
+            t0 = time.perf_counter()
+            _fetch(_with_param(base_url, first, base_q[first]), timeout)
+            baseline = time.perf_counter() - t0
+            for fn in ("SLEEP(5)", "pg_sleep(5)"):
+                payload = base_q[first] + f"' AND {fn}-- "
+                t0 = time.perf_counter()
+                _fetch(_with_param(base_url, first, payload), timeout)
+                took = time.perf_counter() - t0
+                if took >= 4.0 and took >= baseline * 3:
+                    add("sqli-blind", "high",
+                        f"Time-delay SQL injection fires ({fn})",
+                        f"The payload {payload!r} delayed the response to "
+                        f"{took:.1f} s against a {baseline:.2f} s baseline. "
+                        "The database executed the injected function: this "
+                        "injection point is not just an error leak, it runs "
+                        "attacker SQL.",
+                        "Use parameterised queries (prepared statements) "
+                        "everywhere user input reaches SQL; give the "
+                        "database account the fewest privileges it needs.")
+                    break
+        except Exception:
+            pass
+
+    # --- PUT canary (aggressive): can a file actually be written? -------
+    # Only when OPTIONS already advertised PUT. The canary is deleted
+    # again immediately; if the delete fails the finding says so and
+    # names the file left behind.
+    if put_allowed:
+        try:
+            name = f"sv-{secrets.token_hex(4)}.txt"
+            target = urljoin(base_url, "/" + name)
+            body = b"sitevigil probe - delete me"
+            status, _, _, _ = _fetch(
+                target, timeout,
+                headers={"Content-Type": "text/plain"},
+                method="PUT", data=body)
+            if status in (200, 201, 204):
+                _, _, got, _ = _fetch(target, timeout)
+                confirmed = got == body
+                del_status, _, _, _ = _fetch(target, timeout, method="DELETE",
+                                             follow=False)
+                cleaned = del_status in (200, 202, 204, 404)
+                detail = (f"PUT to {target} answered {status} and the file "
+                          + ("came back readable" if confirmed else
+                             "was not readable afterwards")
+                          + (f"; DELETE answered {del_status}, file removed"
+                             if cleaned else
+                             f"; DELETE answered {del_status} -- the canary "
+                             f"file {name} is STILL on the server, remove it "
+                             "manually")
+                          + ". The web root is writable from the internet: "
+                          "an attacker can upload a shell the same way.")
+                add("http-put-write", "critical",
+                    "PUT wrote a file to the web root",
+                    detail,
+                    "Disable PUT and WebDAV unless the application genuinely "
+                    "needs them; restrict any upload endpoint to "
+                    "authenticated users and a safe directory.")
+        except Exception:
+            pass
 
 
 def _check_db_ports(host: str, add, timeout: float = 2.5) -> list[int]:
