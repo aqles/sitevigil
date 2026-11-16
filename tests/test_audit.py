@@ -195,6 +195,35 @@ def _canned_nvd(vendor, product, version):
     ]}
 
 
+# Canned OSINT payloads: shapes copied from the real services (RDAP for
+# example.com via Verisign, crt.sh, ipwho.is), with test domains.
+_RDAP_CANNED = {
+    "ldhName": "EXAMPLE.COM",
+    "entities": [{"roles": ["registrar"], "vcardArray": ["vcard", [
+        ["version", {}, "text", "4.0"],
+        ["fn", {}, "text", "Example Registrar, Inc."],
+    ]]}],
+    "events": [
+        {"eventAction": "registration", "eventDate": "1995-08-14T04:00:00Z"},
+        {"eventAction": "expiration", "eventDate": "2027-08-13T04:00:00Z"},
+    ],
+    "nameservers": [{"ldhName": "A.IANA-SERVERS.NET"},
+                    {"ldhName": "B.IANA-SERVERS.NET"}],
+}
+_CT_CANNED = [
+    {"name_value": "ct.test"},
+    {"name_value": "www.ct.test\nmail.ct.test"},
+    {"name_value": "*.ct.test"},
+    {"name_value": "other.org"},  # different suffix: must be dropped
+    {"name_value": "AS207960 Test Intermediate - ct.test"},
+]
+_GEO_CANNED = {"ip": "93.184.215.14", "success": True,
+               "country": "United States", "region": "Arizona",
+               "city": "Phoenix",
+               "connection": {"asn": 15133, "org": "EDGECAST",
+                              "isp": "EDGECAST"}}
+
+
 class AuditTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -504,9 +533,10 @@ class AuditTest(unittest.TestCase):
         off = audit(self.base + "/echo", probes=False)
         self.assertFalse(any(f["id"] == "xss-reflected"
                              for f in off["findings"]))
-        # the catalog grew by four (plus two aggressive checks: 48 total)
+        # the catalog grew by four (plus two aggressive checks: 48 total,
+        # plus five OSINT checks: 53 total)
         from sitevigil.audit import CHECKS
-        self.assertEqual(len(CHECKS), 48)
+        self.assertEqual(len(CHECKS), 53)
 
     def test_v13_aggressive(self):
         # blind SQLi: /dbblind sleeps 5 s on SLEEP(), leaks nothing else
@@ -766,6 +796,112 @@ class AuditTest(unittest.TestCase):
         status, _h, body, _u = _fetch(self.base + "/truncated-ok", 5)
         self.assertEqual(status, 200)
         self.assertEqual(body, b"hello")
+
+    def test_v14_osint(self):
+        import datetime
+        from unittest import mock
+
+        import sitevigil.audit as audit_module
+        from sitevigil.audit import (
+            _check_osint, _ct_lookup, _geo_lookup, _parse_rdap_date,
+            _rdap_lookup, CHECKS)
+
+        # date parsing: Z suffix (3.10 fromisoformat rejects it), None, junk
+        parsed = _parse_rdap_date("1995-08-14T04:00:00Z")
+        self.assertEqual((parsed.year, parsed.month, parsed.day), (1995, 8, 14))
+        self.assertIsNotNone(parsed.tzinfo)
+        self.assertIsNone(_parse_rdap_date(None))
+        self.assertIsNone(_parse_rdap_date("not a date"))
+
+        # fetch+parse: the real lookup code against canned service bodies
+        def fake_fetch(url, timeout, **kw):
+            if "rdap.org" in url:
+                return 200, {}, json.dumps(_RDAP_CANNED).encode(), url
+            if "crt.sh" in url:
+                return 200, {}, json.dumps(_CT_CANNED).encode(), url
+            if "ipwho.is" in url:
+                return 200, {}, json.dumps(_GEO_CANNED).encode(), url
+            raise AssertionError(f"unexpected fetch {url}")
+
+        with mock.patch.object(audit_module, "_fetch", fake_fetch):
+            rdap = _rdap_lookup("rdap.test", timeout=5)
+            self.assertEqual(rdap["registrar"], "Example Registrar, Inc.")
+            self.assertEqual(rdap["registered"], "1995-08-14T04:00:00Z")
+            self.assertEqual(rdap["expires"], "2027-08-13T04:00:00Z")
+            self.assertEqual(rdap["nameservers"],
+                             ["A.IANA-SERVERS.NET", "B.IANA-SERVERS.NET"])
+            subs = _ct_lookup("ct.test", timeout=5)
+            self.assertEqual(subs, ["ct.test", "mail.ct.test", "www.ct.test"])
+            geo = _geo_lookup("203.0.113.7", timeout=5)
+            self.assertEqual(geo["country"], "United States")
+            self.assertEqual(geo["city"], "Phoenix")
+            self.assertEqual(geo["asn"], 15133)
+            # a dead service returns None, never an exception
+            # (fresh keys: the geo IP above is already cached)
+            with mock.patch.object(audit_module, "_fetch",
+                                   side_effect=Exception("down")):
+                self.assertIsNone(_rdap_lookup("dead.test", timeout=5))
+                self.assertIsNone(_ct_lookup("dead.test", timeout=5))
+                self.assertIsNone(_geo_lookup("203.0.113.8", timeout=5))
+
+        # orchestration: stubbed lookups + DoH + resolver
+        rdap_far = {"registrar": "Example Registrar, Inc.",
+                    "registered": "1995-08-14T04:00:00Z",
+                    "expires": "2027-08-13T04:00:00Z",
+                    "nameservers": ["A.IANA-SERVERS.NET"]}
+        geo_stub = {"country": "United States", "region": "Arizona",
+                    "city": "Phoenix", "isp": "EDGECAST", "org": "EDGECAST",
+                    "asn": 15133}
+
+        def run_osint(rdap_data):
+            seen: list = []
+
+            def add(fid, severity, title, detail, fix, extra=None):
+                seen.append((fid, severity))
+
+            with mock.patch.multiple(
+                    audit_module,
+                    _rdap_lookup=mock.Mock(return_value=rdap_data),
+                    _ct_lookup=mock.Mock(return_value=["ct.test", "www.ct.test"]),
+                    _geo_lookup=mock.Mock(return_value=geo_stub),
+                    _resolve_ip=mock.Mock(return_value="93.184.215.14"),
+                    _doh=mock.Mock(return_value=["93.184.215.14"])):
+                osint = _check_osint("example.com", add, timeout=5)
+            return seen, osint
+
+        seen, osint = run_osint(rdap_far)
+        ids = [s[0] for s in seen]
+        self.assertIn("dns-records", ids)
+        self.assertIn("whois", ids)
+        self.assertIn("subdomains-ct", ids)
+        self.assertIn("ip-geo", ids)
+        self.assertNotIn("domain-expiring", ids)  # expires 2027
+        self.assertEqual(osint["dns"]["a"], ["93.184.215.14"])
+        self.assertEqual(osint["geo"]["ip"], "93.184.215.14")
+        self.assertEqual(osint["geo"]["asn"], 15133)
+        self.assertEqual(osint["subdomains"], ["ct.test", "www.ct.test"])
+        self.assertEqual(osint["whois"]["registrar"], "Example Registrar, Inc.")
+
+        # expiry within 30 days fires the low finding
+        soon = (datetime.datetime.now(datetime.timezone.utc)
+                + datetime.timedelta(days=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        seen_soon, _ = run_osint(dict(rdap_far, expires=soon))
+        expiring = [s for s in seen_soon if s[0] == "domain-expiring"]
+        self.assertEqual(len(expiring), 1)
+        self.assertEqual(expiring[0][1], "low")
+
+        # guards: bare IP and dotless hosts produce nothing, no lookups
+        self.assertEqual(_check_osint("127.0.0.1", lambda *a: None, timeout=5), {})
+        self.assertEqual(_check_osint("localhost", lambda *a: None, timeout=5), {})
+
+        # opt-out: the report carries an empty osint section, no findings
+        off = audit(self.base, osint=False)
+        self.assertEqual(off["osint"], {})
+        self.assertFalse(any(f["id"] in ("dns-records", "whois", "subdomains-ct",
+                                         "ip-geo", "domain-expiring")
+                            for f in off["findings"]))
+        # the catalog grew by five OSINT checks: 53 total
+        self.assertEqual(len(CHECKS), 53)
 
 
 if __name__ == "__main__":

@@ -65,6 +65,7 @@ Fair question — sites like SecurityHeaders or Mozilla Observatory grade a page
 | Active probes | Reflected XSS canary, open-redirect parameters, SQL error messages, PUT/DELETE in OPTIONS Allow — read-only in safe mode (default). `--pentest aggressive` adds a time-delay blind SQLi check and a PUT canary file, written then deleted; run only against systems you own or have written permission to test |
 | Isolation | Cross-Origin-Opener-Policy, Cross-Origin-Resource-Policy, CSP hardening directives (object-src / base-uri) |
 | Domain (via DNS) | SPF and DMARC (only when the domain receives mail), CAA |
+| OSINT | DNS records (A/AAAA/NS/CNAME), domain registration via RDAP (registrar, registered/expiry dates, nameservers; expiry within 30 days is a low finding), subdomains from Certificate Transparency logs (crt.sh), hosting IP location and network (ipwho.is). All passive, free, no API key; `--no-osint` skips them |
 | Known vulnerabilities | Software/version fingerprints (nginx, Apache, PHP, OpenSSL, IIS, WordPress, Drupal, Joomla) matched against NVD CVEs, verified against each CVE's vulnerable version ranges — plus jQuery and WordPress plugins (Elementor, WooCommerce, Contact Form 7, Akismet) fingerprinted from the page source. Every match is cross-checked against the CISA Known Exploited Vulnerabilities catalog and tagged `KNOWN EXPLOITED` when CISA lists it as exploited in the wild |
 | Info disclosure | `Server`, `X-Powered-By` |
 
@@ -107,6 +108,7 @@ sitevigil example.com --badge > badge.svg           # an SVG score badge for you
 sitevigil example.com --no-cve                      # skip the CVE lookup (faster, fully offline)
 sitevigil example.com --no-kev                      # skip the CISA KEV cross-check (no KNOWN EXPLOITED tags)
 sitevigil example.com --no-probes                   # skip the active input probes
+sitevigil example.com --no-osint                    # skip the OSINT lookups (DNS, RDAP, CT subdomains, IP location)
 sitevigil example.com --pentest aggressive          # aggressive probes (blind SQLi timing + PUT canary); authorized targets only
 sitevigil example.com --no-ports                    # skip the exposed-database-port check
 sitevigil example.com --html --output report.html   # write any format straight to a file
@@ -114,7 +116,7 @@ sitevigil example.com --html --output report.html   # write any format straight 
 
 Scoring starts at 100 and loses points per finding (critical 25, high 15, medium 8, low 3), ending in a grade from A to F.
 
-In a terminal, output is coloured (severity tags, score, grade) and a spinner + progress bar walks through the eight audit phases while the scan runs — both switch off automatically for pipes, files, and `--json`/`--markdown`/`--html`, or with `--no-color` / `--no-progress` (`NO_COLOR` is honoured too). The HTML report is a dark theme with severity chips and a per-severity summary.
+In a terminal, output is coloured (severity tags, score, grade) and a spinner + progress bar walks through the ten audit phases while the scan runs — both switch off automatically for pipes, files, and `--json`/`--markdown`/`--html`, or with `--no-color` / `--no-progress` (`NO_COLOR` is honoured too). The HTML report is a dark theme with severity chips and a per-severity summary.
 
 ## Let your AI agent use it
 

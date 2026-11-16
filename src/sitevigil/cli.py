@@ -112,6 +112,10 @@ def main(argv=None) -> int:
     parser.add_argument("--no-ports", action="store_true",
                         help="Skip the exposed-database-port check "
                              "(TCP connect to MySQL/PostgreSQL/Redis/MongoDB ports)")
+    parser.add_argument("--no-osint", action="store_true",
+                        help="Skip the OSINT lookups (DNS records, domain "
+                             "registration via RDAP, Certificate Transparency "
+                             "subdomains, hosting IP location)")
     parser.add_argument("--no-color", action="store_true",
                         help="Disable coloured terminal output (also off when "
                              "stdout is not a terminal, or NO_COLOR is set)")
@@ -175,7 +179,8 @@ def main(argv=None) -> int:
                              ports=not args.no_ports and host not in seen_hosts,
                              progress=progress, kev=not args.no_kev,
                              probes=not args.no_probes,
-                             pentest=args.pentest))
+                             pentest=args.pentest,
+                             osint=not args.no_osint))
         seen_hosts.add(host)
     if progress is not None:
         progress.finish()

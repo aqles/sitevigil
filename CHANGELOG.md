@@ -4,6 +4,35 @@ SiteVigil versions its audit ruleset separately (shown in every report
 and via `sitevigil --checks`) so results stay comparable over time and
 changes to what is checked are never silent.
 
+## 0.14.0 — ruleset 2026.11
+
+- New OSINT phase (phase 10, 5 checks; catalog 48 → 53). All passive,
+  free, no API key, stdlib only; `--no-osint` skips the phase.
+- `dns-records` (info): A/AAAA/NS/CNAME via the existing DNS-over-HTTPS
+  resolver.
+- `whois` (info): registrar, registration/expiry dates, nameservers via
+  RDAP — the HTTPS successor to WHOIS port 43 (structured JSON, works
+  behind proxies; raw port 43 is blocked by many egress proxies).
+  Subdomains fall back to the parent domain's RDAP record.
+- `domain-expiring` (low): domain expires within 30 days.
+- `subdomains-ct` (info): subdomains from Certificate Transparency logs
+  (crt.sh, deduplicated, capped at 50). crt.sh gets a 25 s timeout
+  floor: it is slow enough that the 10 s audit timeout usually
+  returned nothing; results are cached 24 h, so the cost is paid once
+  per domain per day.
+- `ip-geo` (info): hosting IP, country/city, ISP/org, ASN via ipwho.is.
+  The resolved IP is skipped when it is not a public address: behind
+  a proxy, local DNS can answer with a non-public address, and
+  geolocating that would be wrong data, not missing data.
+- Reports carry a machine-readable `osint` section (`dns`, `whois`,
+  `subdomains`, `geo`); a failed OSINT source means its data is
+  absent, never a failed audit — same philosophy as NVD/KEV.
+- OSINT findings are informational (0 weight) except `domain-expiring`
+  (low, 3 points): existing scores are unchanged unless a domain is
+  about to expire.
+- README: the progress bar walks ten phases, not eight (stale since
+  the active-probes phase landed in 0.12.0).
+
 ## 0.13.1 — ruleset 2026.11
 
 - Progress bar no longer leaves a stale `5/9` line in narrow terminals:

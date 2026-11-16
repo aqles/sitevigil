@@ -83,6 +83,11 @@ CHECKS = [
     ("http-methods-dangerous", "medium", "PUT / DELETE are not advertised (OPTIONS Allow)", "https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Methods/PUT"),
     ("sqli-blind", "high", "Time-delay SQL injection does not fire (aggressive mode only)", "https://owasp.org/www-community/attacks/Blind_SQL_Injection"),
     ("http-put-write", "critical", "PUT cannot write a file to the web root (aggressive mode only)", "https://owasp.org/www-project-web-security-testing-guide/"),
+    ("dns-records", "info", "DNS records published for the domain", "https://www.cloudflare.com/learning/dns/dns-records/"),
+    ("whois", "info", "Domain registration details (RDAP)", "https://about.rdap.org/"),
+    ("domain-expiring", "low", "Domain does not expire within 30 days", "https://www.icann.org/resources/pages/approved-with-specs-2013-09-17-en"),
+    ("subdomains-ct", "info", "Subdomains visible in Certificate Transparency logs", "https://certificate.transparency.dev/"),
+    ("ip-geo", "info", "Hosting IP, location and network", "https://ipwho.is/"),
 ]
 
 # Latency budget for the main document fetch, and the well-known database
@@ -97,7 +102,7 @@ DB_PORTS = {3306: "MySQL/MariaDB", 5432: "PostgreSQL",
 AUDIT_PHASES = ["Fetching page", "Redirect chain", "TLS certificate",
                 "Security headers", "Cookies, CORS & exposed files",
                 "DNS records", "CVE lookup (NVD)", "Database ports",
-                "Active probes"]
+                "Active probes", "OSINT"]
 
 # ANSI colours for terminal output. Stdlib only, no colour library.
 _ANSI = {"reset": "\x1b[0m", "bold": "\x1b[1m", "dim": "\x1b[2m",
@@ -350,7 +355,8 @@ class _PageParser(HTMLParser):
 
 def audit(raw_url: str, timeout: float = 10.0, cve: bool = True,
           ports: bool = True, progress=None, kev: bool = True,
-          probes: bool = True, pentest: str = "safe") -> dict:
+          probes: bool = True, pentest: str = "safe",
+          osint: bool = True) -> dict:
     url = raw_url if "://" in raw_url else f"https://{raw_url}"
     parsed = urlparse(url)
     host = parsed.hostname or ""
@@ -683,6 +689,12 @@ def audit(raw_url: str, timeout: float = 10.0, cve: bool = True,
         _active_probes(final_url, timeout, add, pentest)
     step(9)
 
+    # --- OSINT: DNS, registration, CT subdomains, hosting IP -------------
+    osint_data: dict = {}
+    if osint:
+        osint_data = _check_osint(final_host, add, timeout=timeout)
+    step(10)
+
     score = max(0, 100 - sum(WEIGHTS[f["severity"]] for f in findings))
     grade = ("A" if score >= 90 else "B" if score >= 80 else
              "C" if score >= 65 else "D" if score >= 50 else "F")
@@ -690,7 +702,7 @@ def audit(raw_url: str, timeout: float = 10.0, cve: bool = True,
             "reachable": True, "platform": _detect_platform(headers),
             "ruleset": RULESET_VERSION, "redirect_chain": chain,
             "response_time_ms": response_ms, "open_db_ports": open_db_ports,
-            "software": software,
+            "software": software, "osint": osint_data,
             "tls": tls, "score": score, "grade": grade,
             "pentest_mode": pentest if probes else "off",
             "findings": findings}
@@ -846,7 +858,8 @@ def _tls_connect(host: str, port: int, timeout: float = 10):
     return raw
 
 
-_DNS_TYPES = {"MX": 15, "TXT": 16, "CAA": 257}
+_DNS_TYPES = {"A": 1, "AAAA": 28, "NS": 2, "CNAME": 5, "MX": 15, "TXT": 16,
+              "CAA": 257}
 
 
 def _doh(name: str, rtype: str, timeout: float = 5.0) -> list[str]:
@@ -917,6 +930,267 @@ def _check_domain(host: str, add, timeout: float = 5.0) -> None:
                 "Add CAA records naming only the CA(s) you actually use.")
     except Exception:
         pass
+
+
+# --- OSINT: DNS, registration, CT subdomains, hosting IP -------------------
+# Passive public-data lookups (RDAP, crt.sh, ipwho.is, DoH): free, no
+# API key, stdlib only. Same failure philosophy as NVD/KEV: a source
+# being unreachable means its data is simply absent, never a failed
+# or falsified audit. Results are cached on disk for 24 hours next to
+# the NVD/KEV caches (crt.sh in particular is slow).
+_OSINT_CACHE_TTL = 86400
+
+
+def _osint_cache_path(name: str) -> str:
+    import os
+    cache_dir = os.environ.get("SITEVIGIL_CACHE_DIR") or os.path.join(
+        os.path.expanduser("~"), ".cache", "sitevigil")
+    return os.path.join(cache_dir, "osint", name)
+
+
+def _osint_cache_read(name: str):
+    import os
+    import time
+    path = _osint_cache_path(name)
+    try:
+        if os.path.exists(path) and time.time() - os.path.getmtime(path) < _OSINT_CACHE_TTL:
+            with open(path, encoding="utf-8") as fh:
+                return json.load(fh)
+    except Exception:
+        pass
+    return None
+
+
+def _osint_cache_write(name: str, data) -> None:
+    import os
+    path = _osint_cache_path(name)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+    except Exception:
+        pass
+
+
+def _parse_rdap_date(value: str | None):
+    """RDAP event date (ISO 8601, usually Z-suffixed) -> aware datetime."""
+    if not value:
+        return None
+    try:
+        # fromisoformat on Python 3.10 does not accept a trailing Z.
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _rdap_lookup(domain: str, timeout: float = 10.0) -> dict | None:
+    """Domain registration data via RDAP: the HTTPS successor to WHOIS
+    port 43 (structured JSON, works behind proxies, no free-text
+    scraping, no raw TCP port 43 which many egress proxies block).
+    Returns {registrar, registered, expires, nameservers} or None."""
+    key = f"rdap-{domain}.json"
+    cached = _osint_cache_read(key)
+    if cached is not None:
+        return cached
+    try:
+        status, _, body, _ = _fetch(f"https://rdap.org/domain/{domain}", timeout)
+        if status != 200:
+            return None
+        data = json.loads(body)
+    except Exception:
+        return None
+    registrar = None
+    for ent in data.get("entities", []):
+        if "registrar" not in (ent.get("roles") or []):
+            continue
+        for field in (ent.get("vcardArray") or [None, []])[1]:
+            if field[0] == "fn":
+                registrar = field[3]
+                break
+        if registrar:
+            break
+    events = {e.get("eventAction"): e.get("eventDate")
+              for e in data.get("events", [])}
+    out = {"registrar": registrar,
+           "registered": events.get("registration"),
+           "expires": events.get("expiration"),
+           "nameservers": [n.get("ldhName") for n in data.get("nameservers", [])
+                           if n.get("ldhName")]}
+    _osint_cache_write(key, out)
+    return out
+
+
+def _ct_lookup(domain: str, timeout: float = 10.0) -> list[str] | None:
+    """Subdomains seen in Certificate Transparency logs (crt.sh, free,
+    no key). Returns a sorted, deduplicated list (capped at 50) or None
+    when crt.sh is unreachable."""
+    key = f"ct-{domain}.json"
+    cached = _osint_cache_read(key)
+    if cached is not None:
+        return cached
+    try:
+        from urllib.parse import quote
+        status, _, body, _ = _fetch(
+            f"https://crt.sh/?q=%25.{quote(domain)}&output=json", timeout)
+        if status != 200:
+            return None
+        data = json.loads(body)
+    except Exception:
+        return None
+    names: set[str] = set()
+    for entry in data:
+        for raw in (entry.get("name_value") or "").split():
+            name = raw.strip().lower().lstrip("*.").rstrip(".")
+            if name == domain or name.endswith("." + domain):
+                names.add(name)
+    out = sorted(names)[:50]
+    _osint_cache_write(key, out)
+    return out
+
+
+def _geo_lookup(ip: str, timeout: float = 10.0) -> dict | None:
+    """IP location/network via ipwho.is (free, no key, HTTPS).
+    Returns {country, region, city, isp, org, asn} or None."""
+    key = f"geo-{ip}.json"
+    cached = _osint_cache_read(key)
+    if cached is not None:
+        return cached
+    try:
+        status, _, body, _ = _fetch(f"https://ipwho.is/{ip}", timeout)
+        if status != 200:
+            return None
+        data = json.loads(body)
+        if not data.get("success"):
+            return None
+    except Exception:
+        return None
+    conn = data.get("connection") or {}
+    out = {"country": data.get("country"), "region": data.get("region"),
+           "city": data.get("city"), "isp": conn.get("isp"),
+           "org": conn.get("org"),
+           "asn": conn.get("asn") or None}  # ipwho.is reports 0 when unknown
+    _osint_cache_write(key, out)
+    return out
+
+
+def _resolve_ip(host: str) -> str | None:
+    """First public IPv4 for a hostname, or None. Private, loopback and
+    benchmarking ranges are skipped: behind a proxy, local DNS can
+    answer with a non-public address, and geolocating that would be a
+    lie, not data."""
+    import ipaddress
+    try:
+        for family, _, _, _, sockaddr in socket.getaddrinfo(
+                host, 443, proto=socket.IPPROTO_TCP):
+            if family != socket.AF_INET:
+                continue
+            ip = sockaddr[0]
+            if ipaddress.ip_address(ip).is_global:
+                return ip
+    except Exception:
+        pass
+    return None
+
+
+def _check_osint(host: str, add, timeout: float = 10.0) -> dict:
+    """OSINT phase: DNS records, domain registration (RDAP), subdomains
+    from Certificate Transparency logs, and hosting IP location.
+
+    Returns the machine-readable osint section of the report. Every
+    source failing silently means its data is simply absent.
+    """
+    import ipaddress
+
+    osint: dict = {}
+    if not host or "." not in host:
+        return osint
+    try:
+        ipaddress.ip_address(host)
+        return osint  # bare IP: no domain records to check
+    except ValueError:
+        pass
+    domain = host[4:] if host.startswith("www.") else host
+
+    # DNS records (A/AAAA/NS/CNAME) via the same DoH resolver as the
+    # email-auth checks.
+    dns: dict[str, list[str]] = {}
+    for rtype in ("A", "AAAA", "NS", "CNAME"):
+        try:
+            dns[rtype.lower()] = _doh(domain, rtype, timeout=timeout)[:10]
+        except Exception:
+            pass
+    if any(dns.values()):
+        osint["dns"] = dns
+        add("dns-records", "info", "DNS records published for the domain",
+            "; ".join(f"{t.upper()}: {', '.join(v)}"
+                      for t, v in dns.items() if v),
+            "No fix: informational. Review unexpected records (stale A "
+            "records, stray CNAMEs) when hardening the domain.")
+
+    # Domain registration (RDAP). Subdomains have no RDAP record of
+    # their own, so fall back to the parent domain once.
+    whois_domain = domain
+    whois = _rdap_lookup(domain, timeout=timeout)
+    if not whois and "." in domain:
+        parent = domain.split(".", 1)[1]
+        whois = _rdap_lookup(parent, timeout=timeout)
+        if whois:
+            whois_domain = parent
+    if whois:
+        osint["whois"] = whois
+        bits = [f"registrar: {whois['registrar']}" if whois.get("registrar") else "",
+                f"registered: {whois['registered'][:10]}" if whois.get("registered") else "",
+                f"expires: {whois['expires'][:10]}" if whois.get("expires") else "",
+                f"nameservers: {', '.join(whois['nameservers'])}" if whois.get("nameservers") else ""]
+        add("whois", "info", "Domain registration details (RDAP)",
+            "; ".join(b for b in bits if b) or "RDAP returned no registration data.",
+            "No fix: informational. Confirm the registrar and expiry date "
+            "match what the domain owner expects.")
+        expiry = _parse_rdap_date(whois.get("expires"))
+        if expiry:
+            days = (expiry - datetime.now(timezone.utc)).days
+            if days < 30:
+                add("domain-expiring", "low",
+                    f"Domain expires in {max(days, 0)} day(s)",
+                    f"{whois_domain} expires on {whois['expires'][:10]}. Losing "
+                    "the domain means losing the site, its mail and its "
+                    "reputation in one event.",
+                    "Renew the domain and enable auto-renewal with the registrar.")
+
+    # Subdomains from Certificate Transparency logs. crt.sh is slow
+    # (often 10-20 s), so it gets a floor of 25 s regardless of the
+    # audit timeout; the result is cached 24 h, so the cost is paid
+    # once per domain per day.
+    subs = _ct_lookup(domain, timeout=max(timeout, 25))
+    if subs:
+        osint["subdomains"] = subs
+        shown = ", ".join(subs[:10])
+        add("subdomains-ct", "info",
+            f"{len(subs)} subdomain(s) visible in Certificate Transparency logs",
+            shown + (f" (and {len(subs) - 10} more)" if len(subs) > 10 else "")
+            + ". Any of these is a valid target for an attacker: forgotten "
+            "subdomains are a classic entry point.",
+            "No fix: informational. Inventory these subdomains; remove or "
+            "secure the ones no longer in use.")
+
+    # Hosting IP location/network.
+    ip = _resolve_ip(host)
+    if ip:
+        geo = _geo_lookup(ip, timeout=timeout)
+        if geo:
+            osint["geo"] = {"ip": ip, **geo}
+            place = ", ".join(b for b in (ip, geo.get("city") or "",
+                                          geo.get("region") or "",
+                                          geo.get("country") or "") if b)
+            net = " / ".join(x for x in (
+                f"AS{geo['asn']}" if geo.get("asn") else "",
+                geo.get("org") or geo.get("isp") or "") if x)
+            add("ip-geo", "info", "Hosting IP, location and network",
+                place + (f" ({net})" if net else "")
+                + ". Confirms where the site is actually hosted.",
+                "No fix: informational. Confirm the hosting location and "
+                "network match the expected provider.")
+    return osint
 
 
 # --- Known-vulnerability (CVE) matching -----------------------------------
