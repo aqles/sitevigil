@@ -88,6 +88,11 @@ CHECKS = [
     ("domain-expiring", "low", "Domain does not expire within 30 days", "https://www.icann.org/resources/pages/approved-with-specs-2013-09-17-en"),
     ("subdomains-ct", "info", "Subdomains visible in Certificate Transparency logs", "https://certificate.transparency.dev/"),
     ("ip-geo", "info", "Hosting IP, location and network", "https://ipwho.is/"),
+    ("ssti", "high", "Template expression is evaluated, not just reflected", "https://owasp.org/www-community/attacks/Server_Side_Template_Injection"),
+    ("crlf-injection", "medium", "CRLF in input does not reach response headers", "https://owasp.org/www-community/attacks/CRLF_Injection"),
+    ("lfi-traversal", "high", "Path traversal does not read local files (aggressive mode only)", "https://owasp.org/www-community/attacks/Path_Traversal"),
+    ("cmdi-sleep", "high", "Time-delay OS command injection does not fire (aggressive mode only)", "https://owasp.org/www-community/attacks/Command_Injection"),
+    ("sqli-blind-bool", "high", "Boolean-based blind SQL injection does not fire (aggressive mode only)", "https://owasp.org/www-community/attacks/Blind_SQL_Injection"),
 ]
 
 # Latency budget for the main document fetch, and the well-known database
@@ -1470,6 +1475,8 @@ _SQL_ERRORS = (
     "ora-01756", "ora-00933", "quoted string not properly terminated",
     "unclosed quotation mark", "microsoft ole db", "odbc sql server",
     "warning: pg_", "sqlite",
+    # NoSQL signatures: the same stray-quote probe catches MongoDB errors
+    "mongoerror", "cast to objectid failed", "mongodb", "bson",
 )
 _REDIRECT_PARAMS = ("next", "url", "redirect", "return", "target", "continue")
 
@@ -1486,11 +1493,14 @@ def _with_param(base: str, name: str, value: str) -> str:
 def _active_probes(base_url: str, timeout: float, add,
                    pentest: str = "safe") -> None:
     """Input probes. Safe mode is non-destructive: reflected XSS, open
-    redirect, SQL error messages, dangerous HTTP methods. Aggressive
-    mode adds two confirmation probes that touch the target harder --
-    a time-delay blind SQL injection check and a canary file written
-    with PUT and deleted again. Aggressive mode is opt-in only: run it
-    solely against systems you own or have written permission to test.
+    redirect, SQL error messages, dangerous HTTP methods, plus the
+    read-only SSTI canary and CRLF header check. Aggressive mode adds
+    confirmation probes that touch the target harder -- a time-delay
+    blind SQL injection check (MySQL, PostgreSQL, MSSQL), an OS
+    command-injection sleep check, a boolean-based blind SQLi check,
+    a path-traversal read, and a canary file written with PUT and
+    deleted again. Aggressive mode is opt-in only: run it solely
+    against systems you own or have written permission to test.
     Each probe stops at the first hit; a probe that errors or times
     out is skipped silently and never fails the audit.
     """
@@ -1606,6 +1616,53 @@ def _active_probes(base_url: str, timeout: float, add,
     except Exception:
         pass
 
+    # --- SSTI: does the template engine evaluate our expression? --------
+    # A fixed distinctive product: 1337*1337 = 1787569. If the evaluated
+    # result appears in the response, the template engine ran attacker
+    # input. The number is distinctive enough that its mere presence is
+    # the signal; a merely reflected payload never contains it.
+    try:
+        for payload in ("{{1337*1337}}", "${1337*1337}"):
+            _, _, body, _ = _fetch(
+                _with_param(base_url, "svssti", payload), timeout)
+            text = body.decode("utf-8", errors="ignore")
+            if "1787569" in text:
+                add("ssti", "high",
+                    f"Server-side template injection ({payload} evaluated)",
+                    "The template expression evaluated to 1787569 in the "
+                    "response: user input reaches the template engine "
+                    "unescaped. Template injection can lead to remote "
+                    "code execution; confirm exploitability in that "
+                    "context.",
+                    "Render user input as data, never as a template; "
+                    "sandbox the template engine and disable dangerous "
+                    "attributes and filters.")
+                break
+    except Exception:
+        pass
+
+    # --- CRLF injection: does our CRLF reach a response header? ---------
+    # The payload must be appended raw: _with_param would double-encode
+    # %0d%0a into %250d%250a, and the application would only ever see
+    # the literal percent signs, never a real carriage return.
+    try:
+        sep = "&" if "?" in base_url else "?"
+        probe_url = base_url + sep + "svcrlf=%0d%0aX-SiteVigil-Probe:1"
+        _, headers, _, _ = _fetch(probe_url, timeout, follow=False)
+        if any(k.lower() == "x-sitevigil-probe" for k in headers):
+            add("crlf-injection", "medium",
+                "CRLF injection reaches response headers",
+                "A %0d%0a sequence in the request produced an "
+                "X-SiteVigil-Probe response header: the application "
+                "reflects user input into headers without sanitising "
+                "it. Injected headers enable cache poisoning and "
+                "response splitting.",
+                "Strip CR and LF from any user input reflected into "
+                "headers; use the framework's header API instead of "
+                "building header values by string concatenation.")
+    except Exception:
+        pass
+
     if pentest != "aggressive":
         return
 
@@ -1625,14 +1682,17 @@ def _active_probes(base_url: str, timeout: float, add,
             t0 = time.perf_counter()
             _fetch(_with_param(base_url, first, base_q[first]), timeout)
             baseline = time.perf_counter() - t0
-            for fn in ("SLEEP(5)", "pg_sleep(5)"):
-                payload = base_q[first] + f"' AND {fn}-- "
+            for label, payload in (
+                    ("SLEEP(5)", base_q[first] + "' AND SLEEP(5)-- "),
+                    ("pg_sleep(5)", base_q[first] + "' AND pg_sleep(5)-- "),
+                    ("WAITFOR DELAY",
+                     base_q[first] + "'; WAITFOR DELAY '0:0:5'-- ")):
                 t0 = time.perf_counter()
                 _fetch(_with_param(base_url, first, payload), timeout)
                 took = time.perf_counter() - t0
                 if took >= 4.0 and took >= baseline * 3:
                     add("sqli-blind", "high",
-                        f"Time-delay SQL injection fires ({fn})",
+                        f"Time-delay SQL injection fires ({label})",
                         f"The payload {payload!r} delayed the response to "
                         f"{took:.1f} s against a {baseline:.2f} s baseline. "
                         "The database executed the injected function: this "
@@ -1644,6 +1704,101 @@ def _active_probes(base_url: str, timeout: float, add,
                     break
         except Exception:
             pass
+
+    # --- Command injection sleep (aggressive): does a shell sleep run? --
+    # Same timing rule as blind SQLi: >= 4.0 s and >= 3x the baseline.
+    # Independent of the SQL probes: a shell and a database are
+    # different injection points.
+    try:
+        t0 = time.perf_counter()
+        _fetch(_with_param(base_url, "svcmdi", "1"), timeout)
+        baseline = time.perf_counter() - t0
+        for payload in ("1; sleep 5", "1$(sleep 5)"):
+            t0 = time.perf_counter()
+            _fetch(_with_param(base_url, "svcmdi", payload), timeout)
+            took = time.perf_counter() - t0
+            if took >= 4.0 and took >= baseline * 3:
+                add("cmdi-sleep", "high",
+                    f"Time-delay OS command injection fires ({payload!r})",
+                    f"The payload {payload!r} delayed the response to "
+                    f"{took:.1f} s against a {baseline:.2f} s baseline. "
+                    "The shell executed the injected command: this input "
+                    "reaches a shell, not just the database.",
+                    "Never pass user input to a shell; use argument "
+                    "arrays and allow-lists instead of shelling out, and "
+                    "run the application with the fewest privileges it "
+                    "needs.")
+                break
+    except Exception:
+        pass
+
+    # --- Boolean blind SQLi (aggressive): true vs false response diff ---
+    # Four requests: true/false twice. A finding needs a stable,
+    # repeatable length difference in the same direction both times;
+    # a single differing pair proves nothing on a dynamic page.
+    try:
+        p = urlparse(base_url)
+        q = dict(parse_qsl(p.query, keep_blank_values=True))
+        if q:
+            first = next(iter(q))
+            true_val = q[first] + " AND 1=1"
+            false_val = q[first] + " AND 1=2"
+        else:
+            first = "svbool"
+            true_val, false_val = "1 AND 1=1", "1 AND 1=2"
+        lens = []
+        for val in (true_val, false_val, true_val, false_val):
+            _, _, body, _ = _fetch(_with_param(base_url, first, val), timeout)
+            lens.append(len(body))
+        t1, f1, t2, f2 = lens
+        if (abs(t1 - f1) > 100 and abs(t2 - f2) > 100
+                and abs(t1 - t2) <= 100 and abs(f1 - f2) <= 100
+                and (t1 - f1) * (t2 - f2) > 0):
+            add("sqli-blind-bool", "high",
+                "Boolean-based blind SQL injection fires",
+                f"AND 1=1 answers {t1} bytes and AND 1=2 answers {f1} "
+                f"bytes, repeatably (second pair: {t2} vs {f2}). The "
+                "database evaluates the injected condition: the page "
+                "content changes with attacker-controlled truth values. "
+                "Dynamic pages can produce length differences on their "
+                "own, so confirm this one by hand before treating it as "
+                "a certain injection.",
+                "Use parameterised queries (prepared statements) "
+                "everywhere user input reaches SQL; give the database "
+                "account the fewest privileges it needs.")
+    except Exception:
+        pass
+
+    # --- Path traversal / LFI (aggressive): can local files be read? -----
+    # Read-only from the audit's side: the payload asks the application
+    # to include a file, and only the well-known /etc/passwd marker
+    # (or win.ini) counts as a hit. No file is written or extracted
+    # beyond that marker check.
+    try:
+        for name in ("file", "page"):
+            hit = False
+            for payload in ("../../../../etc/passwd",
+                            "....//....//....//etc/passwd"):
+                _, _, body, _ = _fetch(
+                    _with_param(base_url, name, payload), timeout)
+                text = body.decode("utf-8", errors="ignore")
+                if "root:x:0:0" in text or "[boot loader]" in text:
+                    add("lfi-traversal", "high",
+                        f"Path traversal via the {name!r} parameter",
+                        f"The payload {payload!r} returned local file "
+                        "content (a /etc/passwd or win.ini marker). The "
+                        "application includes attacker-chosen paths: "
+                        "local files -- configuration, keys, source -- "
+                        "are readable through it.",
+                        "Never build file paths from user input; map "
+                        "inputs to an allow-list of files and resolve "
+                        "them inside a fixed base directory.")
+                    hit = True
+                    break
+            if hit:
+                break
+    except Exception:
+        pass
 
     # --- PUT canary (aggressive): can a file actually be written? -------
     # Only when OPTIONS already advertised PUT. The canary is deleted

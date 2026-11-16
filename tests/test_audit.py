@@ -121,6 +121,58 @@ class Handler(BaseHTTPRequestHandler):
             if any("SLEEP(" in v or "pg_sleep(" in v for v in vals):
                 time.sleep(5)  # blind injection point, no error leak
             self._send(200, INDEX, "text/html")
+        elif urlsplit(self.path).path == "/dbmongo":
+            if "%27" in self.path or "'" in self.path:
+                self._send(200, b"MongoError: Cast to ObjectId failed for "
+                            b"value \"1'\" at path \"_id\"", "text/html")
+            else:
+                self._send(200, INDEX, "text/html")
+        elif urlsplit(self.path).path == "/ssti":
+            vals = [v for vs in
+                    parse_qs(urlsplit(self.path).query).values() for v in vs]
+            if any("1337*1337" in v for v in vals):
+                self._send(200, b"result: 1787569", "text/html")
+            else:
+                self._send(200, b"ok", "text/html")
+        elif urlsplit(self.path).path == "/crlf":
+            self.send_response(200)
+            if "%0d%0a" in self.path.lower():
+                self.send_header("X-SiteVigil-Probe", "1")
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(b"ok")
+        elif urlsplit(self.path).path == "/cmdi":
+            import time
+            vals = [v for vs in
+                    parse_qs(urlsplit(self.path).query).values() for v in vs]
+            if any("sleep 5" in v.lower() for v in vals):
+                time.sleep(5)
+            self._send(200, b"ok", "text/html")
+        elif urlsplit(self.path).path == "/bool":
+            vals = [v for vs in
+                    parse_qs(urlsplit(self.path).query).values() for v in vs]
+            if any(v.strip() == "1 AND 1=1" for v in vals):
+                self._send(200, b"A" * 1000, "text/html")
+            elif any(v.strip() == "1 AND 1=2" for v in vals):
+                self._send(200, b"false", "text/html")
+            else:
+                self._send(200, b"medium-length-body", "text/html")
+        elif urlsplit(self.path).path == "/mssql":
+            import time
+            vals = [v for vs in
+                    parse_qs(urlsplit(self.path).query).values() for v in vs]
+            if any("waitfor delay" in v.lower() for v in vals):
+                time.sleep(5)  # MSSQL only: SLEEP()/pg_sleep() stay fast
+            self._send(200, INDEX, "text/html")
+        elif urlsplit(self.path).path == "/lfi":
+            vals = [v for vs in
+                    parse_qs(urlsplit(self.path).query).values() for v in vs]
+            if any("etc/passwd" in v for v in vals):
+                self._send(200, b"root:x:0:0:root:/root:/bin/bash\n"
+                            b"daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n",
+                            "text/plain")
+            else:
+                self._send(200, b"ok", "text/html")
         elif self.path in ("/truncated", "/truncated-ok"):
             # chunked response that ends mid-body: one valid chunk, then
             # the connection closes without the terminating zero chunk
@@ -534,9 +586,9 @@ class AuditTest(unittest.TestCase):
         self.assertFalse(any(f["id"] == "xss-reflected"
                              for f in off["findings"]))
         # the catalog grew by four (plus two aggressive checks: 48 total,
-        # plus five OSINT checks: 53 total)
+        # plus five OSINT checks: 53 total, plus five pentest checks: 58)
         from sitevigil.audit import CHECKS
-        self.assertEqual(len(CHECKS), 53)
+        self.assertEqual(len(CHECKS), 58)
 
     def test_v13_aggressive(self):
         # blind SQLi: /dbblind sleeps 5 s on SLEEP(), leaks nothing else
@@ -900,8 +952,47 @@ class AuditTest(unittest.TestCase):
         self.assertFalse(any(f["id"] in ("dns-records", "whois", "subdomains-ct",
                                          "ip-geo", "domain-expiring")
                             for f in off["findings"]))
-        # the catalog grew by five OSINT checks: 53 total
-        self.assertEqual(len(CHECKS), 53)
+        # the catalog grew by five OSINT checks: 53 total (58 after v0.15)
+        self.assertEqual(len(CHECKS), 58)
+
+    def test_v15_aggressive2(self):
+        from sitevigil.audit import CHECKS
+
+        new_ids = {"ssti", "crlf-injection", "lfi-traversal", "cmdi-sleep",
+                   "sqli-blind-bool"}
+
+        # safe mode gains: SSTI canary, CRLF header, NoSQL error strings
+        ssti = audit(self.base + "/ssti")
+        self.assertTrue(any(f["id"] == "ssti" for f in ssti["findings"]))
+        crlf = audit(self.base + "/crlf")
+        self.assertTrue(any(f["id"] == "crlf-injection"
+                            for f in crlf["findings"]))
+        mongo = audit(self.base + "/dbmongo?id=1")
+        self.assertTrue(any(f["id"] == "sqli-error"
+                            for f in mongo["findings"]))
+        # plain index: none of the new probes fire
+        idx = audit(self.base)
+        self.assertFalse(any(f["id"] in new_ids for f in idx["findings"]))
+        # aggressive mode: LFI, command sleep, boolean blind, MSSQL WAITFOR
+        lfi = audit(self.base + "/lfi", pentest="aggressive")
+        self.assertTrue(any(f["id"] == "lfi-traversal"
+                            for f in lfi["findings"]))
+        cmdi = audit(self.base + "/cmdi", pentest="aggressive")
+        self.assertTrue(any(f["id"] == "cmdi-sleep"
+                            for f in cmdi["findings"]))
+        boolean = audit(self.base + "/bool", pentest="aggressive")
+        self.assertTrue(any(f["id"] == "sqli-blind-bool"
+                            for f in boolean["findings"]))
+        mssql = audit(self.base + "/mssql?id=1", pentest="aggressive")
+        self.assertTrue(any(f["id"] == "sqli-blind"
+                            for f in mssql["findings"]))
+        # safe mode runs none of the aggressive probes
+        safe = audit(self.base + "/lfi", pentest="safe")
+        self.assertFalse(any(f["id"] in ("lfi-traversal", "cmdi-sleep",
+                                         "sqli-blind-bool")
+                            for f in safe["findings"]))
+        # the catalog grew by five pentest checks: 58 total
+        self.assertEqual(len(CHECKS), 58)
 
 
 if __name__ == "__main__":

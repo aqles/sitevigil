@@ -4,6 +4,29 @@ SiteVigil versions its audit ruleset separately (shown in every report
 and via `sitevigil --checks`) so results stay comparable over time and
 changes to what is checked are never silent.
 
+## 0.15.0 — ruleset 2026.11
+
+- Sharper pentest probes (5 new checks; catalog 53 → 58). Safe mode
+  gains two read-only probes: `ssti` (high, `{{1337*1337}}` /
+  `${1337*1337}` canary, fires only if the evaluated result 1787569
+  appears) and `crlf-injection` (medium, fires only if the injected
+  `X-SiteVigil-Probe` header comes back; the payload is appended raw
+  because URL-encoding would double-encode `%0d%0a`). The SQL error
+  probe now also matches MongoDB error signatures (`sqli-error`).
+- `--pentest aggressive` gains three probes: `lfi-traversal` (high,
+  `file`/`page` params, fires only on a /etc/passwd or win.ini
+  marker), `cmdi-sleep` (high, `; sleep 5` / `$(sleep 5)`, same
+  >= 4 s and >= 3x baseline timing rule as blind SQLi) and
+  `sqli-blind-bool` (high, true/false response-length difference,
+  confirmed twice so a dynamic page cannot trigger it alone).
+  `sqli-blind` gains a third payload, MSSQL `WAITFOR DELAY`.
+- Limits unchanged: detection only — no data extraction, no
+  credential brute force, no out-of-band callbacks, no denial of
+  service. Aggressive mode stays opt-in for systems you own or have
+  written permission to test.
+- Tests 21/21 (fixture endpoints: /lfi, /ssti, /crlf, /cmdi, /bool,
+  /mssql, /dbmongo; exact-path matching).
+
 ## 0.14.0 — ruleset 2026.11
 
 - New OSINT phase (phase 10, 5 checks; catalog 48 → 53). All passive,

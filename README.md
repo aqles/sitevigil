@@ -62,7 +62,7 @@ Fair question — sites like SecurityHeaders or Mozilla Observatory grade a page
 | Exposed services | Database ports open to the internet — MySQL/MariaDB (3306), PostgreSQL (5432), Redis (6379), MongoDB (27017), plain TCP connect |
 | Page content | Mixed content (HTTP subresources on an HTTPS page), cross-origin scripts without Subresource Integrity |
 | Methods & discovery | HTTP TRACE enabled, missing `/.well-known/security.txt` |
-| Active probes | Reflected XSS canary, open-redirect parameters, SQL error messages, PUT/DELETE in OPTIONS Allow — read-only in safe mode (default). `--pentest aggressive` adds a time-delay blind SQLi check and a PUT canary file, written then deleted; run only against systems you own or have written permission to test |
+| Active probes | Reflected XSS canary, open-redirect parameters, SQL error messages (incl. MongoDB), PUT/DELETE in OPTIONS Allow, SSTI canary (`{{1337*1337}}` → 1787569), CRLF header injection — read-only in safe mode (default). `--pentest aggressive` adds a time-delay blind SQLi check (MySQL, PostgreSQL, MSSQL WAITFOR), an OS command-injection sleep check, a boolean-based blind SQLi check, a path-traversal read, and a PUT canary file, written then deleted; run only against systems you own or have written permission to test |
 | Isolation | Cross-Origin-Opener-Policy, Cross-Origin-Resource-Policy, CSP hardening directives (object-src / base-uri) |
 | Domain (via DNS) | SPF and DMARC (only when the domain receives mail), CAA |
 | OSINT | DNS records (A/AAAA/NS/CNAME), domain registration via RDAP (registrar, registered/expiry dates, nameservers; expiry within 30 days is a low finding), subdomains from Certificate Transparency logs (crt.sh), hosting IP location and network (ipwho.is). All passive, free, no API key; `--no-osint` skips them |
@@ -109,7 +109,7 @@ sitevigil example.com --no-cve                      # skip the CVE lookup (faste
 sitevigil example.com --no-kev                      # skip the CISA KEV cross-check (no KNOWN EXPLOITED tags)
 sitevigil example.com --no-probes                   # skip the active input probes
 sitevigil example.com --no-osint                    # skip the OSINT lookups (DNS, RDAP, CT subdomains, IP location)
-sitevigil example.com --pentest aggressive          # aggressive probes (blind SQLi timing + PUT canary); authorized targets only
+sitevigil example.com --pentest aggressive          # aggressive probes (blind SQLi incl. MSSQL, command-injection sleep, boolean blind SQLi, path traversal, PUT canary); authorized targets only
 sitevigil example.com --no-ports                    # skip the exposed-database-port check
 sitevigil example.com --html --output report.html   # write any format straight to a file
 ```
