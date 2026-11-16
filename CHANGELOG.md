@@ -4,6 +4,31 @@ SiteVigil versions its audit ruleset separately (shown in every report
 and via `sitevigil --checks`) so results stay comparable over time and
 changes to what is checked are never silent.
 
+## 0.16.0 — ruleset 2026.11
+
+- Parallel audit phases (no new checks; catalog stays 58). Slow
+  targets used to cost one sequential round-trip per probe, per OSINT
+  source and per database port -- on jakarta.go.id that was a 51.8 s
+  full audit. Now: OSINT sources (DNS, RDAP, CT logs, geo) run
+  concurrently, the 4 database-port connects run concurrently, and
+  the probes run concurrently in two waves (6 safe units, then
+  aggressive units). Findings are still added in the original order,
+  so output is identical, only faster. Full audit of jakarta.go.id:
+  51.8 s → 35.5 s (fresh cache, measured from the dev VM; crt.sh and
+  the target's own speed vary run to run by ~±10 s).
+- Two deliberate exceptions, both documented in code. CVE lookups stay
+  sequential: NVD allows 5 requests per 30 s without a key, and
+  bursting would 429 -- on shared egress IPs that silently drops CVE
+  data. The timed blind-SQLi probe runs alone before the other
+  aggressive units: its verdict is a duration, and a concurrent sleep
+  payload would inflate it (caught live during verification: a false
+  `sqli-blind` on the /cmdi fixture; regression tests added).
+  The PUT canary stays sequential and last -- it writes.
+- A job that raises contributes nothing and never kills the others;
+  if threads cannot start, everything falls back to sequential
+  execution. Stdlib only (`concurrent.futures`), no new dependency.
+- Tests 22/22.
+
 ## 0.15.0 — ruleset 2026.11
 
 - Sharper pentest probes (5 new checks; catalog 53 → 58). Safe mode

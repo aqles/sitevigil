@@ -994,6 +994,109 @@ class AuditTest(unittest.TestCase):
         # the catalog grew by five pentest checks: 58 total
         self.assertEqual(len(CHECKS), 58)
 
+    def test_v16_parallel(self):
+        import socket as sock
+        from unittest import mock
+
+        import sitevigil.audit as audit_module
+        from sitevigil.audit import (
+            _check_db_ports, _check_osint, _run_concurrent, CHECKS)
+
+        # _run_concurrent: a raising job contributes nothing, the rest
+        # still complete; results keep their keys (no completion-order
+        # mixup)
+        def boom():
+            raise Exception("boom")
+
+        out = _run_concurrent({"a": lambda: 1, "b": boom, "c": lambda: 3})
+        self.assertEqual(out, {"a": 1, "c": 3})
+
+        # fallback: when threads cannot start, jobs still run sequentially
+        with mock.patch("concurrent.futures.ThreadPoolExecutor",
+                        side_effect=Exception("no threads")):
+            out = _run_concurrent({"x": lambda: 10, "y": lambda: 20})
+        self.assertEqual(out, {"x": 10, "y": 20})
+
+        # OSINT: same stubs as v14 -- the parallel gather must produce
+        # the same findings and the same osint section, in the same order
+        rdap_far = {"registrar": "Example Registrar, Inc.",
+                    "registered": "1995-08-14T04:00:00Z",
+                    "expires": "2027-08-13T04:00:00Z",
+                    "nameservers": ["A.IANA-SERVERS.NET"]}
+        geo_stub = {"country": "United States", "region": "Arizona",
+                    "city": "Phoenix", "isp": "EDGECAST", "org": "EDGECAST",
+                    "asn": 15133}
+
+        def run_osint(ct_stub):
+            seen: list = []
+
+            def add(fid, severity, title, detail, fix, extra=None):
+                seen.append((fid, severity))
+
+            with mock.patch.multiple(
+                    audit_module,
+                    _rdap_lookup=mock.Mock(return_value=rdap_far),
+                    _ct_lookup=ct_stub,
+                    _geo_lookup=mock.Mock(return_value=geo_stub),
+                    _resolve_ip=mock.Mock(return_value="93.184.215.14"),
+                    _doh=mock.Mock(return_value=["93.184.215.14"])):
+                osint = _check_osint("example.com", add, timeout=5)
+            return seen, osint
+
+        seen, osint = run_osint(
+            mock.Mock(return_value=["ct.test", "www.ct.test"]))
+        self.assertEqual([s[0] for s in seen],
+                         ["dns-records", "whois", "subdomains-ct", "ip-geo"])
+        self.assertEqual(osint["dns"]["a"], ["93.184.215.14"])
+        self.assertEqual(osint["geo"]["ip"], "93.184.215.14")
+        self.assertEqual(osint["subdomains"], ["ct.test", "www.ct.test"])
+        self.assertEqual(osint["whois"]["registrar"], "Example Registrar, Inc.")
+
+        # a failing source kills nothing else: crt.sh raising leaves the
+        # other three findings intact and the audit un-crashed
+        seen2, osint2 = run_osint(mock.Mock(side_effect=Exception("down")))
+        self.assertEqual([s[0] for s in seen2],
+                         ["dns-records", "whois", "ip-geo"])
+        self.assertNotIn("subdomains", osint2)
+
+        # ports: one real listener + one closed port, probed concurrently
+        # -- the closed port must not be reported open (results are keyed
+        # by port, not by completion order)
+        listener = sock.socket()
+        listener.setsockopt(sock.SOL_SOCKET, sock.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        fake_port = listener.getsockname()[1]
+        old_ports = audit_module.DB_PORTS
+        audit_module.DB_PORTS = {fake_port: "TestDB", 59999: "ClosedDB"}
+        try:
+            seen3: list = []
+
+            def add3(fid, severity, title, detail, fix, extra=None):
+                seen3.append((fid, severity))
+
+            open_ports = _check_db_ports("127.0.0.1", add3, timeout=2.5)
+        finally:
+            audit_module.DB_PORTS = old_ports
+            listener.close()
+        self.assertEqual(open_ports, [fake_port])
+        self.assertEqual([s[0] for s in seen3], ["db-port-exposed"])
+
+        # timed probes must not contaminate each other: on the
+        # single-threaded fixture server a concurrent 5 s sleep queues
+        # the other unit's request behind it and fakes a timing hit
+        cmdi = audit(self.base + "/cmdi", pentest="aggressive")
+        cmdi_ids = [f["id"] for f in cmdi["findings"]]
+        self.assertIn("cmdi-sleep", cmdi_ids)
+        self.assertNotIn("sqli-blind", cmdi_ids)
+        blind = audit(self.base + "/dbblind?id=1", pentest="aggressive")
+        blind_ids = [f["id"] for f in blind["findings"]]
+        self.assertIn("sqli-blind", blind_ids)
+        self.assertNotIn("cmdi-sleep", blind_ids)
+
+        # catalog unchanged: parallelization adds no checks
+        self.assertEqual(len(CHECKS), 58)
+
 
 if __name__ == "__main__":
     unittest.main()

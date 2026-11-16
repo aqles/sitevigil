@@ -1097,6 +1097,41 @@ def _resolve_ip(host: str) -> str | None:
     return None
 
 
+def _run_concurrent(jobs: dict) -> dict:
+    """Run independent no-arg callables concurrently, return {name: result}.
+
+    The work here is network-bound, so threads buy real wall time (the
+    GIL is released while waiting on sockets). A job that raises
+    contributes nothing -- its result is simply absent -- and never
+    kills the others. Falls back to sequential execution when threads
+    cannot start, so the audit still completes. Only non-None results
+    are kept, so a job signals "no data" by returning None.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _gather(results: dict) -> dict:
+        return {k: v for k, v in results.items() if v is not None}
+
+    try:
+        with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+            futures = {name: pool.submit(fn) for name, fn in jobs.items()}
+            out = {}
+            for name, fut in futures.items():
+                try:
+                    out[name] = fut.result()
+                except Exception:
+                    continue
+            return _gather(out)
+    except Exception:
+        out = {}
+        for name, fn in jobs.items():
+            try:
+                out[name] = fn()
+            except Exception:
+                continue
+        return _gather(out)
+
+
 def _check_osint(host: str, add, timeout: float = 10.0) -> dict:
     """OSINT phase: DNS records, domain registration (RDAP), subdomains
     from Certificate Transparency logs, and hosting IP location.
@@ -1116,15 +1151,48 @@ def _check_osint(host: str, add, timeout: float = 10.0) -> dict:
         pass
     domain = host[4:] if host.startswith("www.") else host
 
+    # The four sources are independent, so they are fetched concurrently:
+    # the phase costs max(source) instead of sum(source). crt.sh alone is
+    # often 10-20 s while DNS, RDAP and geo finish in ~1 s each. Findings
+    # are still added afterwards, sequentially and in the original order,
+    # so report output stays deterministic.
+    def _gather_dns():
+        dns: dict[str, list[str]] = {}
+        for rtype in ("A", "AAAA", "NS", "CNAME"):
+            try:
+                dns[rtype.lower()] = _doh(domain, rtype, timeout=timeout)[:10]
+            except Exception:
+                pass
+        return dns if any(dns.values()) else None
+
+    def _gather_whois():
+        whois_domain = domain
+        whois = _rdap_lookup(domain, timeout=timeout)
+        if not whois and "." in domain:
+            parent = domain.split(".", 1)[1]
+            whois = _rdap_lookup(parent, timeout=timeout)
+            if whois:
+                whois_domain = parent
+        return (whois, whois_domain) if whois else None
+
+    def _gather_subs():
+        subs = _ct_lookup(domain, timeout=max(timeout, 25))
+        return subs or None
+
+    def _gather_geo():
+        ip = _resolve_ip(host)
+        if not ip:
+            return None
+        geo = _geo_lookup(ip, timeout=timeout)
+        return (ip, geo) if geo else None
+
+    gathered = _run_concurrent({"dns": _gather_dns, "whois": _gather_whois,
+                                "subs": _gather_subs, "geo": _gather_geo})
+
     # DNS records (A/AAAA/NS/CNAME) via the same DoH resolver as the
     # email-auth checks.
-    dns: dict[str, list[str]] = {}
-    for rtype in ("A", "AAAA", "NS", "CNAME"):
-        try:
-            dns[rtype.lower()] = _doh(domain, rtype, timeout=timeout)[:10]
-        except Exception:
-            pass
-    if any(dns.values()):
+    dns = gathered.get("dns")
+    if dns:
         osint["dns"] = dns
         add("dns-records", "info", "DNS records published for the domain",
             "; ".join(f"{t.upper()}: {', '.join(v)}"
@@ -1133,14 +1201,9 @@ def _check_osint(host: str, add, timeout: float = 10.0) -> dict:
             "records, stray CNAMEs) when hardening the domain.")
 
     # Domain registration (RDAP). Subdomains have no RDAP record of
-    # their own, so fall back to the parent domain once.
-    whois_domain = domain
-    whois = _rdap_lookup(domain, timeout=timeout)
-    if not whois and "." in domain:
-        parent = domain.split(".", 1)[1]
-        whois = _rdap_lookup(parent, timeout=timeout)
-        if whois:
-            whois_domain = parent
+    # their own, so the gather step falls back to the parent domain once.
+    whois_pair = gathered.get("whois")
+    whois, whois_domain = whois_pair if whois_pair else (None, domain)
     if whois:
         osint["whois"] = whois
         bits = [f"registrar: {whois['registrar']}" if whois.get("registrar") else "",
@@ -1166,7 +1229,7 @@ def _check_osint(host: str, add, timeout: float = 10.0) -> dict:
     # (often 10-20 s), so it gets a floor of 25 s regardless of the
     # audit timeout; the result is cached 24 h, so the cost is paid
     # once per domain per day.
-    subs = _ct_lookup(domain, timeout=max(timeout, 25))
+    subs = gathered.get("subs")
     if subs:
         osint["subdomains"] = subs
         shown = ", ".join(subs[:10])
@@ -1179,9 +1242,9 @@ def _check_osint(host: str, add, timeout: float = 10.0) -> dict:
             "secure the ones no longer in use.")
 
     # Hosting IP location/network.
-    ip = _resolve_ip(host)
+    geo_pair = gathered.get("geo")
+    ip, geo = geo_pair if geo_pair else (None, None)
     if ip:
-        geo = _geo_lookup(ip, timeout=timeout)
         if geo:
             osint["geo"] = {"ip": ip, **geo}
             place = ", ".join(b for b in (ip, geo.get("city") or "",
@@ -1502,303 +1565,417 @@ def _active_probes(base_url: str, timeout: float, add,
     deleted again. Aggressive mode is opt-in only: run it solely
     against systems you own or have written permission to test.
     Each probe stops at the first hit; a probe that errors or times
-    out is skipped silently and never fails the audit.
+    out is skipped silently and never fails the audit. The probes run
+    concurrently (safe units together, then aggressive units together)
+    because on a slow target a dozen sequential round-trips is what
+    makes an audit feel like a timeout; findings are added in the
+    original order so output stays deterministic.
     """
     import secrets
     import time
     from urllib.parse import parse_qsl, quote, urlencode
 
+    # Each probe is a unit returning (findings, extra): findings is a
+    # list of (id, severity, title, detail, fix) tuples, extra carries
+    # the state later units depend on (put_allowed, sqli_found). Units
+    # run concurrently via _run_concurrent; findings are added
+    # afterwards in the original order, so report output stays
+    # deterministic. The PUT canary stays sequential and last: it
+    # writes, so it never runs in parallel with anything.
+    def _unit_methods():
+        found = []
+
+        def add(fid, severity, title, detail, fix):
+            found.append((fid, severity, title, detail, fix))
+
+        put_allowed = False
+
+        # --- Dangerous methods: does OPTIONS advertise PUT or DELETE? ---
+        # Read-only: the Allow header is the evidence. No PUT is ever sent
+        # in safe mode, so nothing is written to the target.
+        try:
+            status, headers, _, _ = _fetch(base_url, timeout, method="OPTIONS",
+                                           follow=False)
+            allow = {m.strip() for m in (_first(headers, "allow") or "").split(",")}
+            dangerous = sorted(m for m in ("PUT", "DELETE") if m in allow)
+            put_allowed = "PUT" in allow
+            dav = _first(headers, "dav")
+            if dangerous or dav:
+                add("http-methods-dangerous", "medium",
+                    "PUT or DELETE advertised by the server",
+                    f"OPTIONS on {base_url} advertises: "
+                    f"{', '.join(sorted(allow)) or '(no Allow header)'}"
+                    + (f"; WebDAV enabled ({dav})" if dav else "") +
+                    ". A writable method on a public site is a foothold: "
+                    "uploaded files have led to full compromise.",
+                    "Disable PUT and DELETE (and WebDAV) unless the application "
+                    "genuinely needs them; restrict any upload endpoint to "
+                    "authenticated users and a safe directory.")
+        except Exception:
+            pass
+        return found, {"put_allowed": put_allowed}
+
+    def _unit_xss():
+        found = []
+
+        def add(fid, severity, title, detail, fix):
+            found.append((fid, severity, title, detail, fix))
+
+        # --- Reflected XSS: is our canary echoed back unencoded? -------
+        canary = "svx" + secrets.token_hex(4) + "\"><'"
+        try:
+            for probe_url in (_with_param(base_url, "svxss", canary),
+                              urljoin(base_url, "/" + quote(canary, safe="")),
+                              _with_param(base_url, "q", canary)):
+                try:
+                    _, _, body, _ = _fetch(probe_url, timeout)
+                except Exception:
+                    continue
+                text = body.decode("utf-8", errors="ignore")
+                at = text.find(canary)
+                if at < 0:
+                    continue
+                snippet = " ".join(text[max(0, at - 40):at + len(canary) + 40].split())
+                add("xss-reflected", "high",
+                    "User input is reflected unencoded in the page",
+                    f"The probe string {canary!r} came back verbatim in the "
+                    f"response: ...{snippet}... Unencoded reflection of "
+                    f"\"><' means an attacker can break out of the surrounding "
+                    "markup; confirm exploitability in that context, but treat "
+                    "any raw reflection as a real hole.",
+                    "Encode all user-controlled output for its context "
+                    "(HTML-encode in markup, attribute-encode in attributes); "
+                    "enforce a Content-Security-Policy as defence in depth.")
+                break
+        except Exception:
+            pass
+        return found, {}
+
+    def _unit_redirect():
+        found = []
+
+        def add(fid, severity, title, detail, fix):
+            found.append((fid, severity, title, detail, fix))
+
+        # --- Open redirect: does a redirect parameter point outside? ----
+        try:
+            for name in _REDIRECT_PARAMS:
+                probe_url = _with_param(base_url, name, "https://example.com")
+                try:
+                    status, headers, _, _ = _fetch(probe_url, timeout, follow=False)
+                except Exception:
+                    continue
+                if status not in (301, 302, 303, 307, 308):
+                    continue
+                target = _first(headers, "location") or ""
+                if urlparse(target).netloc == "example.com":
+                    add("open-redirect", "medium",
+                        f"Open redirect via the {name!r} parameter",
+                        f"{probe_url} answers {status} to https://example.com. "
+                        "An attacker can use the site's own domain to send "
+                        "victims to a phishing page.",
+                        "Allow only relative redirect targets or an explicit "
+                        "allow-list of destinations; never redirect to a "
+                        "raw user-supplied URL.")
+                    break
+        except Exception:
+            pass
+        return found, {}
+
+    def _unit_sqli_error():
+        found = []
+
+        def add(fid, severity, title, detail, fix):
+            found.append((fid, severity, title, detail, fix))
+
+        sqli_found = False
+
+        # --- SQL error: does a stray quote leak a database error? -------
+        try:
+            p = urlparse(base_url)
+            q = dict(parse_qsl(p.query, keep_blank_values=True))
+            if q:
+                first = next(iter(q))
+                q[first] = q[first] + "'"
+                probe_url = p._replace(query=urlencode(q)).geturl()
+            else:
+                probe_url = _with_param(base_url, "svsql", "1'")
+            _, _, body, _ = _fetch(probe_url, timeout)
+            text = body.decode("utf-8", errors="ignore").lower()
+            hit = next((s for s in _SQL_ERRORS if s in text), None)
+            if hit:
+                sqli_found = True
+                add("sqli-error", "high",
+                    "Database error message leaks from crafted input",
+                    f"A single quote in the request produced a database error "
+                    f"mentioning {hit!r}. The input reaches the database "
+                    "unsanitized: an error message alone does not prove data "
+                    "can be extracted, but it proves the injection point is "
+                    "real and tells the attacker which database runs behind it.",
+                    "Use parameterised queries (prepared statements) everywhere "
+                    "user input reaches SQL; turn database error details off "
+                    "in production responses.")
+        except Exception:
+            pass
+        return found, {"sqli_found": sqli_found}
+
+    def _unit_ssti():
+        found = []
+
+        def add(fid, severity, title, detail, fix):
+            found.append((fid, severity, title, detail, fix))
+
+        # --- SSTI: does the template engine evaluate our expression? ----
+        # A fixed distinctive product: 1337*1337 = 1787569. If the evaluated
+        # result appears in the response, the template engine ran attacker
+        # input. The number is distinctive enough that its mere presence is
+        # the signal; a merely reflected payload never contains it.
+        try:
+            for payload in ("{{1337*1337}}", "${1337*1337}"):
+                _, _, body, _ = _fetch(
+                    _with_param(base_url, "svssti", payload), timeout)
+                text = body.decode("utf-8", errors="ignore")
+                if "1787569" in text:
+                    add("ssti", "high",
+                        f"Server-side template injection ({payload} evaluated)",
+                        "The template expression evaluated to 1787569 in the "
+                        "response: user input reaches the template engine "
+                        "unescaped. Template injection can lead to remote "
+                        "code execution; confirm exploitability in that "
+                        "context.",
+                        "Render user input as data, never as a template; "
+                        "sandbox the template engine and disable dangerous "
+                        "attributes and filters.")
+                    break
+        except Exception:
+            pass
+        return found, {}
+
+    def _unit_crlf():
+        found = []
+
+        def add(fid, severity, title, detail, fix):
+            found.append((fid, severity, title, detail, fix))
+
+        # --- CRLF injection: does our CRLF reach a response header? -----
+        # The payload must be appended raw: _with_param would double-encode
+        # %0d%0a into %250d%250a, and the application would only ever see
+        # the literal percent signs, never a real carriage return.
+        try:
+            sep = "&" if "?" in base_url else "?"
+            probe_url = base_url + sep + "svcrlf=%0d%0aX-SiteVigil-Probe:1"
+            _, headers, _, _ = _fetch(probe_url, timeout, follow=False)
+            if any(k.lower() == "x-sitevigil-probe" for k in headers):
+                add("crlf-injection", "medium",
+                    "CRLF injection reaches response headers",
+                    "A %0d%0a sequence in the request produced an "
+                    "X-SiteVigil-Probe response header: the application "
+                    "reflects user input into headers without sanitising "
+                    "it. Injected headers enable cache poisoning and "
+                    "response splitting.",
+                    "Strip CR and LF from any user input reflected into "
+                    "headers; use the framework's header API instead of "
+                    "building header values by string concatenation.")
+        except Exception:
+            pass
+        return found, {}
+
+    safe = _run_concurrent({
+        "methods": _unit_methods, "xss": _unit_xss,
+        "redirect": _unit_redirect, "sqli-error": _unit_sqli_error,
+        "ssti": _unit_ssti, "crlf": _unit_crlf,
+    })
     put_allowed = False
     sqli_found = False
-
-    # --- Dangerous methods: does OPTIONS advertise PUT or DELETE? -------
-    # Read-only: the Allow header is the evidence. No PUT is ever sent
-    # in safe mode, so nothing is written to the target.
-    try:
-        status, headers, _, _ = _fetch(base_url, timeout, method="OPTIONS",
-                                       follow=False)
-        allow = {m.strip() for m in (_first(headers, "allow") or "").split(",")}
-        dangerous = sorted(m for m in ("PUT", "DELETE") if m in allow)
-        put_allowed = "PUT" in allow
-        dav = _first(headers, "dav")
-        if dangerous or dav:
-            add("http-methods-dangerous", "medium",
-                "PUT or DELETE advertised by the server",
-                f"OPTIONS on {base_url} advertises: "
-                f"{', '.join(sorted(allow)) or '(no Allow header)'}"
-                + (f"; WebDAV enabled ({dav})" if dav else "") +
-                ". A writable method on a public site is a foothold: "
-                "uploaded files have led to full compromise.",
-                "Disable PUT and DELETE (and WebDAV) unless the application "
-                "genuinely needs them; restrict any upload endpoint to "
-                "authenticated users and a safe directory.")
-    except Exception:
-        pass
-
-    # --- Reflected XSS: is our canary echoed back unencoded? -----------
-    canary = "svx" + secrets.token_hex(4) + "\"><'"
-    try:
-        for probe_url in (_with_param(base_url, "svxss", canary),
-                          urljoin(base_url, "/" + quote(canary, safe="")),
-                          _with_param(base_url, "q", canary)):
-            try:
-                _, _, body, _ = _fetch(probe_url, timeout)
-            except Exception:
-                continue
-            text = body.decode("utf-8", errors="ignore")
-            at = text.find(canary)
-            if at < 0:
-                continue
-            snippet = " ".join(text[max(0, at - 40):at + len(canary) + 40].split())
-            add("xss-reflected", "high",
-                "User input is reflected unencoded in the page",
-                f"The probe string {canary!r} came back verbatim in the "
-                f"response: ...{snippet}... Unencoded reflection of "
-                f"\"><' means an attacker can break out of the surrounding "
-                "markup; confirm exploitability in that context, but treat "
-                "any raw reflection as a real hole.",
-                "Encode all user-controlled output for its context "
-                "(HTML-encode in markup, attribute-encode in attributes); "
-                "enforce a Content-Security-Policy as defence in depth.")
-            break
-    except Exception:
-        pass
-
-    # --- Open redirect: does a redirect parameter point outside? --------
-    try:
-        for name in _REDIRECT_PARAMS:
-            probe_url = _with_param(base_url, name, "https://example.com")
-            try:
-                status, headers, _, _ = _fetch(probe_url, timeout, follow=False)
-            except Exception:
-                continue
-            if status not in (301, 302, 303, 307, 308):
-                continue
-            target = _first(headers, "location") or ""
-            if urlparse(target).netloc == "example.com":
-                add("open-redirect", "medium",
-                    f"Open redirect via the {name!r} parameter",
-                    f"{probe_url} answers {status} to https://example.com. "
-                    "An attacker can use the site's own domain to send "
-                    "victims to a phishing page.",
-                    "Allow only relative redirect targets or an explicit "
-                    "allow-list of destinations; never redirect to a "
-                    "raw user-supplied URL.")
-                break
-    except Exception:
-        pass
-
-    # --- SQL error: does a stray quote leak a database error? -----------
-    try:
-        p = urlparse(base_url)
-        q = dict(parse_qsl(p.query, keep_blank_values=True))
-        if q:
-            first = next(iter(q))
-            q[first] = q[first] + "'"
-            probe_url = p._replace(query=urlencode(q)).geturl()
-        else:
-            probe_url = _with_param(base_url, "svsql", "1'")
-        _, _, body, _ = _fetch(probe_url, timeout)
-        text = body.decode("utf-8", errors="ignore").lower()
-        hit = next((s for s in _SQL_ERRORS if s in text), None)
-        if hit:
-            sqli_found = True
-            add("sqli-error", "high",
-                "Database error message leaks from crafted input",
-                f"A single quote in the request produced a database error "
-                f"mentioning {hit!r}. The input reaches the database "
-                "unsanitized: an error message alone does not prove data "
-                "can be extracted, but it proves the injection point is "
-                "real and tells the attacker which database runs behind it.",
-                "Use parameterised queries (prepared statements) everywhere "
-                "user input reaches SQL; turn database error details off "
-                "in production responses.")
-    except Exception:
-        pass
-
-    # --- SSTI: does the template engine evaluate our expression? --------
-    # A fixed distinctive product: 1337*1337 = 1787569. If the evaluated
-    # result appears in the response, the template engine ran attacker
-    # input. The number is distinctive enough that its mere presence is
-    # the signal; a merely reflected payload never contains it.
-    try:
-        for payload in ("{{1337*1337}}", "${1337*1337}"):
-            _, _, body, _ = _fetch(
-                _with_param(base_url, "svssti", payload), timeout)
-            text = body.decode("utf-8", errors="ignore")
-            if "1787569" in text:
-                add("ssti", "high",
-                    f"Server-side template injection ({payload} evaluated)",
-                    "The template expression evaluated to 1787569 in the "
-                    "response: user input reaches the template engine "
-                    "unescaped. Template injection can lead to remote "
-                    "code execution; confirm exploitability in that "
-                    "context.",
-                    "Render user input as data, never as a template; "
-                    "sandbox the template engine and disable dangerous "
-                    "attributes and filters.")
-                break
-    except Exception:
-        pass
-
-    # --- CRLF injection: does our CRLF reach a response header? ---------
-    # The payload must be appended raw: _with_param would double-encode
-    # %0d%0a into %250d%250a, and the application would only ever see
-    # the literal percent signs, never a real carriage return.
-    try:
-        sep = "&" if "?" in base_url else "?"
-        probe_url = base_url + sep + "svcrlf=%0d%0aX-SiteVigil-Probe:1"
-        _, headers, _, _ = _fetch(probe_url, timeout, follow=False)
-        if any(k.lower() == "x-sitevigil-probe" for k in headers):
-            add("crlf-injection", "medium",
-                "CRLF injection reaches response headers",
-                "A %0d%0a sequence in the request produced an "
-                "X-SiteVigil-Probe response header: the application "
-                "reflects user input into headers without sanitising "
-                "it. Injected headers enable cache poisoning and "
-                "response splitting.",
-                "Strip CR and LF from any user input reflected into "
-                "headers; use the framework's header API instead of "
-                "building header values by string concatenation.")
-    except Exception:
-        pass
+    for _name in ("methods", "xss", "redirect", "sqli-error", "ssti", "crlf"):
+        _findings, _extra = safe.get(_name, ([], {}))
+        for _fid, _sev, _title, _detail, _fix in _findings:
+            add(_fid, _sev, _title, _detail, _fix)
+        put_allowed = _extra.get("put_allowed", put_allowed)
+        sqli_found = _extra.get("sqli_found", sqli_found)
 
     if pentest != "aggressive":
         return
 
-    # --- Blind SQLi (aggressive): does a SLEEP payload delay the reply?
-    # Skipped when the error probe already proved the injection point:
-    # a second confirmation buys nothing and costs a 5 s database sleep.
-    if not sqli_found:
-        try:
-            p = urlparse(base_url)
-            q = dict(parse_qsl(p.query, keep_blank_values=True))
-            base_q = dict(q)
-            if q:
-                first = next(iter(q))
-            else:
-                first = "svsql"
-                base_q[first] = "1"
-            t0 = time.perf_counter()
-            _fetch(_with_param(base_url, first, base_q[first]), timeout)
-            baseline = time.perf_counter() - t0
-            for label, payload in (
-                    ("SLEEP(5)", base_q[first] + "' AND SLEEP(5)-- "),
-                    ("pg_sleep(5)", base_q[first] + "' AND pg_sleep(5)-- "),
-                    ("WAITFOR DELAY",
-                     base_q[first] + "'; WAITFOR DELAY '0:0:5'-- ")):
+    def _unit_blind():
+        found = []
+
+        def add(fid, severity, title, detail, fix):
+            found.append((fid, severity, title, detail, fix))
+
+        # --- Blind SQLi (aggressive): does a SLEEP payload delay the reply?
+        # Skipped when the error probe already proved the injection point:
+        # a second confirmation buys nothing and costs a 5 s database sleep.
+        if not sqli_found:
+            try:
+                p = urlparse(base_url)
+                q = dict(parse_qsl(p.query, keep_blank_values=True))
+                base_q = dict(q)
+                if q:
+                    first = next(iter(q))
+                else:
+                    first = "svsql"
+                    base_q[first] = "1"
                 t0 = time.perf_counter()
-                _fetch(_with_param(base_url, first, payload), timeout)
+                _fetch(_with_param(base_url, first, base_q[first]), timeout)
+                baseline = time.perf_counter() - t0
+                for label, payload in (
+                        ("SLEEP(5)", base_q[first] + "' AND SLEEP(5)-- "),
+                        ("pg_sleep(5)", base_q[first] + "' AND pg_sleep(5)-- "),
+                        ("WAITFOR DELAY",
+                         base_q[first] + "'; WAITFOR DELAY '0:0:5'-- ")):
+                    t0 = time.perf_counter()
+                    _fetch(_with_param(base_url, first, payload), timeout)
+                    took = time.perf_counter() - t0
+                    if took >= 4.0 and took >= baseline * 3:
+                        add("sqli-blind", "high",
+                            f"Time-delay SQL injection fires ({label})",
+                            f"The payload {payload!r} delayed the response to "
+                            f"{took:.1f} s against a {baseline:.2f} s baseline. "
+                            "The database executed the injected function: this "
+                            "injection point is not just an error leak, it runs "
+                            "attacker SQL.",
+                            "Use parameterised queries (prepared statements) "
+                            "everywhere user input reaches SQL; give the "
+                            "database account the fewest privileges it needs.")
+                        break
+            except Exception:
+                pass
+        return found, {}
+
+    def _unit_cmdi():
+        found = []
+
+        def add(fid, severity, title, detail, fix):
+            found.append((fid, severity, title, detail, fix))
+
+        # --- Command injection sleep (aggressive): does a shell sleep run?
+        # Same timing rule as blind SQLi: >= 4.0 s and >= 3x the baseline.
+        # Independent of the SQL probes: a shell and a database are
+        # different injection points.
+        try:
+            t0 = time.perf_counter()
+            _fetch(_with_param(base_url, "svcmdi", "1"), timeout)
+            baseline = time.perf_counter() - t0
+            for payload in ("1; sleep 5", "1$(sleep 5)"):
+                t0 = time.perf_counter()
+                _fetch(_with_param(base_url, "svcmdi", payload), timeout)
                 took = time.perf_counter() - t0
                 if took >= 4.0 and took >= baseline * 3:
-                    add("sqli-blind", "high",
-                        f"Time-delay SQL injection fires ({label})",
+                    add("cmdi-sleep", "high",
+                        f"Time-delay OS command injection fires ({payload!r})",
                         f"The payload {payload!r} delayed the response to "
                         f"{took:.1f} s against a {baseline:.2f} s baseline. "
-                        "The database executed the injected function: this "
-                        "injection point is not just an error leak, it runs "
-                        "attacker SQL.",
-                        "Use parameterised queries (prepared statements) "
-                        "everywhere user input reaches SQL; give the "
-                        "database account the fewest privileges it needs.")
+                        "The shell executed the injected command: this input "
+                        "reaches a shell, not just the database.",
+                        "Never pass user input to a shell; use argument "
+                        "arrays and allow-lists instead of shelling out, and "
+                        "run the application with the fewest privileges it "
+                        "needs.")
                     break
         except Exception:
             pass
+        return found, {}
 
-    # --- Command injection sleep (aggressive): does a shell sleep run? --
-    # Same timing rule as blind SQLi: >= 4.0 s and >= 3x the baseline.
-    # Independent of the SQL probes: a shell and a database are
-    # different injection points.
-    try:
-        t0 = time.perf_counter()
-        _fetch(_with_param(base_url, "svcmdi", "1"), timeout)
-        baseline = time.perf_counter() - t0
-        for payload in ("1; sleep 5", "1$(sleep 5)"):
-            t0 = time.perf_counter()
-            _fetch(_with_param(base_url, "svcmdi", payload), timeout)
-            took = time.perf_counter() - t0
-            if took >= 4.0 and took >= baseline * 3:
-                add("cmdi-sleep", "high",
-                    f"Time-delay OS command injection fires ({payload!r})",
-                    f"The payload {payload!r} delayed the response to "
-                    f"{took:.1f} s against a {baseline:.2f} s baseline. "
-                    "The shell executed the injected command: this input "
-                    "reaches a shell, not just the database.",
-                    "Never pass user input to a shell; use argument "
-                    "arrays and allow-lists instead of shelling out, and "
-                    "run the application with the fewest privileges it "
-                    "needs.")
-                break
-    except Exception:
-        pass
+    def _unit_bool():
+        found = []
 
-    # --- Boolean blind SQLi (aggressive): true vs false response diff ---
-    # Four requests: true/false twice. A finding needs a stable,
-    # repeatable length difference in the same direction both times;
-    # a single differing pair proves nothing on a dynamic page.
-    try:
-        p = urlparse(base_url)
-        q = dict(parse_qsl(p.query, keep_blank_values=True))
-        if q:
-            first = next(iter(q))
-            true_val = q[first] + " AND 1=1"
-            false_val = q[first] + " AND 1=2"
-        else:
-            first = "svbool"
-            true_val, false_val = "1 AND 1=1", "1 AND 1=2"
-        lens = []
-        for val in (true_val, false_val, true_val, false_val):
-            _, _, body, _ = _fetch(_with_param(base_url, first, val), timeout)
-            lens.append(len(body))
-        t1, f1, t2, f2 = lens
-        if (abs(t1 - f1) > 100 and abs(t2 - f2) > 100
-                and abs(t1 - t2) <= 100 and abs(f1 - f2) <= 100
-                and (t1 - f1) * (t2 - f2) > 0):
-            add("sqli-blind-bool", "high",
-                "Boolean-based blind SQL injection fires",
-                f"AND 1=1 answers {t1} bytes and AND 1=2 answers {f1} "
-                f"bytes, repeatably (second pair: {t2} vs {f2}). The "
-                "database evaluates the injected condition: the page "
-                "content changes with attacker-controlled truth values. "
-                "Dynamic pages can produce length differences on their "
-                "own, so confirm this one by hand before treating it as "
-                "a certain injection.",
-                "Use parameterised queries (prepared statements) "
-                "everywhere user input reaches SQL; give the database "
-                "account the fewest privileges it needs.")
-    except Exception:
-        pass
+        def add(fid, severity, title, detail, fix):
+            found.append((fid, severity, title, detail, fix))
 
-    # --- Path traversal / LFI (aggressive): can local files be read? -----
-    # Read-only from the audit's side: the payload asks the application
-    # to include a file, and only the well-known /etc/passwd marker
-    # (or win.ini) counts as a hit. No file is written or extracted
-    # beyond that marker check.
-    try:
-        for name in ("file", "page"):
-            hit = False
-            for payload in ("../../../../etc/passwd",
-                            "....//....//....//etc/passwd"):
-                _, _, body, _ = _fetch(
-                    _with_param(base_url, name, payload), timeout)
-                text = body.decode("utf-8", errors="ignore")
-                if "root:x:0:0" in text or "[boot loader]" in text:
-                    add("lfi-traversal", "high",
-                        f"Path traversal via the {name!r} parameter",
-                        f"The payload {payload!r} returned local file "
-                        "content (a /etc/passwd or win.ini marker). The "
-                        "application includes attacker-chosen paths: "
-                        "local files -- configuration, keys, source -- "
-                        "are readable through it.",
-                        "Never build file paths from user input; map "
-                        "inputs to an allow-list of files and resolve "
-                        "them inside a fixed base directory.")
-                    hit = True
+        # --- Boolean blind SQLi (aggressive): true vs false response diff
+        # Four requests: true/false twice. A finding needs a stable,
+        # repeatable length difference in the same direction both times;
+        # a single differing pair proves nothing on a dynamic page.
+        try:
+            p = urlparse(base_url)
+            q = dict(parse_qsl(p.query, keep_blank_values=True))
+            if q:
+                first = next(iter(q))
+                true_val = q[first] + " AND 1=1"
+                false_val = q[first] + " AND 1=2"
+            else:
+                first = "svbool"
+                true_val, false_val = "1 AND 1=1", "1 AND 1=2"
+            lens = []
+            for val in (true_val, false_val, true_val, false_val):
+                _, _, body, _ = _fetch(_with_param(base_url, first, val), timeout)
+                lens.append(len(body))
+            t1, f1, t2, f2 = lens
+            if (abs(t1 - f1) > 100 and abs(t2 - f2) > 100
+                    and abs(t1 - t2) <= 100 and abs(f1 - f2) <= 100
+                    and (t1 - f1) * (t2 - f2) > 0):
+                add("sqli-blind-bool", "high",
+                    "Boolean-based blind SQL injection fires",
+                    f"AND 1=1 answers {t1} bytes and AND 1=2 answers {f1} "
+                    f"bytes, repeatably (second pair: {t2} vs {f2}). The "
+                    "database evaluates the injected condition: the page "
+                    "content changes with attacker-controlled truth values. "
+                    "Dynamic pages can produce length differences on their "
+                    "own, so confirm this one by hand before treating it as "
+                    "a certain injection.",
+                    "Use parameterised queries (prepared statements) "
+                    "everywhere user input reaches SQL; give the database "
+                    "account the fewest privileges it needs.")
+        except Exception:
+            pass
+        return found, {}
+
+    def _unit_lfi():
+        found = []
+
+        def add(fid, severity, title, detail, fix):
+            found.append((fid, severity, title, detail, fix))
+
+        # --- Path traversal / LFI (aggressive): can local files be read?
+        # Read-only from the audit's side: the payload asks the application
+        # to include a file, and only the well-known /etc/passwd marker
+        # (or win.ini) counts as a hit. No file is written or extracted
+        # beyond that marker check.
+        try:
+            for name in ("file", "page"):
+                hit = False
+                for payload in ("../../../../etc/passwd",
+                                "....//....//....//etc/passwd"):
+                    _, _, body, _ = _fetch(
+                        _with_param(base_url, name, payload), timeout)
+                    text = body.decode("utf-8", errors="ignore")
+                    if "root:x:0:0" in text or "[boot loader]" in text:
+                        add("lfi-traversal", "high",
+                            f"Path traversal via the {name!r} parameter",
+                            f"The payload {payload!r} returned local file "
+                            "content (a /etc/passwd or win.ini marker). The "
+                            "application includes attacker-chosen paths: "
+                            "local files -- configuration, keys, source -- "
+                            "are readable through it.",
+                            "Never build file paths from user input; map "
+                            "inputs to an allow-list of files and resolve "
+                            "them inside a fixed base directory.")
+                        hit = True
+                        break
+                if hit:
                     break
-            if hit:
-                break
-    except Exception:
-        pass
+        except Exception:
+            pass
+        return found, {}
+
+    # The timed blind probe runs alone first: its verdict is a duration,
+    # and a concurrent sleep payload from the command-injection probe
+    # would inflate it -- on a single-threaded server the blind request
+    # queues behind the other unit's 5 s sleep and looks like a hit
+    # (proven live on /cmdi: sqli-blind fired where only cmdi-sleep
+    # should). The remaining units measure content, not time, so they
+    # can share a wave: queueing only makes them slower, never wrong.
+    _findings, _ = _unit_blind()
+    for _fid, _sev, _title, _detail, _fix in _findings:
+        add(_fid, _sev, _title, _detail, _fix)
+    aggr = _run_concurrent({
+        "cmdi": _unit_cmdi, "bool": _unit_bool, "lfi": _unit_lfi,
+    })
+    for _name in ("cmdi", "bool", "lfi"):
+        _findings, _ = aggr.get(_name, ([], {}))
+        for _fid, _sev, _title, _detail, _fix in _findings:
+            add(_fid, _sev, _title, _detail, _fix)
 
     # --- PUT canary (aggressive): can a file actually be written? -------
     # Only when OPTIONS already advertised PUT. The canary is deleted
@@ -1851,24 +2028,35 @@ def _check_db_ports(host: str, add, timeout: float = 2.5) -> list[int]:
     HTTP proxy: a proxy completes every handshake itself, so a naive
     direct connect behind one "succeeds" for every port on every host --
     the CONNECT response is the only honest signal there.
+
+    The four connects run concurrently: the sweep costs max(port)
+    instead of sum(port). On a network where filtered ports burn the
+    full timeout each, that is ~2.5 s instead of ~10 s.
     """
-    open_ports: list[int] = []
-    for port, service in DB_PORTS.items():
+    def _probe(port: int) -> bool:
         try:
             sock = _tls_connect(host, port, timeout=timeout)
             sock.close()
-            open_ports.append(port)
-            add("db-port-exposed", "high",
-                f"{service} port {port} is open to the internet",
-                f"A TCP connection to {host}:{port} succeeded from "
-                "outside the network. Anyone on the internet can "
-                "attempt to talk to this database service.",
-                "Bind the database to localhost or a private network "
-                "and firewall the port; application servers should "
-                "reach it over a private interface or a tunnel, never "
-                "the public internet.")
-        except OSError:
-            pass
+            return True
+        except Exception:
+            return False
+
+    results = _run_concurrent(
+        {port: (lambda p=port: _probe(p)) for port in DB_PORTS})
+    open_ports: list[int] = []
+    for port, service in DB_PORTS.items():
+        if not results.get(port):
+            continue
+        open_ports.append(port)
+        add("db-port-exposed", "high",
+            f"{service} port {port} is open to the internet",
+            f"A TCP connection to {host}:{port} succeeded from "
+            "outside the network. Anyone on the internet can "
+            "attempt to talk to this database service.",
+            "Bind the database to localhost or a private network "
+            "and firewall the port; application servers should "
+            "reach it over a private interface or a tunnel, never "
+            "the public internet.")
     return open_ports
 
 
