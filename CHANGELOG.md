@@ -4,6 +4,17 @@ SiteVigil versions its audit ruleset separately (shown in every report
 and via `sitevigil --checks`) so results stay comparable over time and
 changes to what is checked are never silent.
 
+## 0.17.1 — 2026-11-26 — ruleset 2026.11
+
+- Fixed the `http-no-redirect` false positive seen when WebCheck
+  scanned itself from Vercel: `_fetch` reported an HTTP error with
+  the *requested* URL as the final URL, so an error on the https hop
+  (e.g. a 403) masqueraded as "http did not redirect to HTTPS" even
+  though the redirect chain proved the redirect happened. `_fetch`
+  now reports the URL that actually errored, and the http->https
+  probe (`_http_redirects_to_https`) trusts the redirect chain: if
+  any hop is https, the redirect is counted as working.
+
 ## 0.17.0 — 2026-11-26 — ruleset 2026.11
 
 Breaking: private/loopback hosts are refused by default (use
