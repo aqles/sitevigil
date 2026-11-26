@@ -3,6 +3,7 @@
 Standard library only -- MCP over stdio is newline-delimited JSON-RPC,
 which does not need an SDK for a single read-only tool.
 """
+import hmac
 import json
 import sys
 
@@ -10,10 +11,13 @@ from . import __version__
 from .audit import audit, generate_fix
 
 PROTOCOL = "2024-11-05"
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 _URL_SCHEMA = {
     "type": "object",
     "properties": {"url": {"type": "string",
-                           "description": "Site to audit, e.g. https://example.com"}},
+                           "description": "Site to audit, e.g. https://example.com"},
+                   "allow_private": {"type": "boolean",
+                                     "description": "Allow auditing private/loopback hosts (local development only; default false)."}},
     "required": ["url"],
 }
 TOOLS = [
@@ -57,7 +61,13 @@ def handle(msg: dict) -> dict | None:
             return {"content": [{"type": "text",
                                  "text": "tool arguments must include a url string"}],
                     "isError": True}
-        report = audit(url)
+        allow_private = (arguments.get("allow_private", False)
+                         if isinstance(arguments, dict) else False)
+        if not isinstance(allow_private, bool):
+            return {"content": [{"type": "text",
+                                 "text": "allow_private must be a boolean"}],
+                    "isError": True}
+        report = audit(url, allow_private=allow_private)
         payload = report
         if name == "suggest_fix":
             payload = {"url": report.get("final_url") or report.get("url"),
@@ -70,7 +80,7 @@ def handle(msg: dict) -> dict | None:
     return None  # notifications and unknown methods: no reply
 
 
-def _make_http_server(host: str, port: int):
+def _make_http_server(host: str, port: int, token: str | None = None):
     from http.server import BaseHTTPRequestHandler, HTTPServer
 
     class Handler(BaseHTTPRequestHandler):
@@ -96,6 +106,14 @@ def _make_http_server(host: str, port: int):
             if self.path != "/mcp":
                 self._send(404, b'{"error": "not found"}')
                 return
+            # H2: when a token is configured, every POST to /mcp must
+            # carry it -- the tools audit arbitrary URLs, so an
+            # unauthenticated endpoint is an open SSRF service.
+            if token is not None:
+                auth = self.headers.get("Authorization") or ""
+                if not hmac.compare_digest(auth, f"Bearer {token}"):
+                    self._send(401, b'{"error": "unauthorized"}')
+                    return
             try:
                 length = int(self.headers.get("Content-Length") or 0)
             except ValueError:
@@ -133,16 +151,23 @@ def _make_http_server(host: str, port: int):
     return HTTPServer((host, port), Handler)
 
 
-def serve_http(port: int, host: str = "127.0.0.1") -> None:
+def serve_http(port: int, host: str = "127.0.0.1",
+               allow_remote: bool = False, token: str | None = None) -> None:
     """Serve MCP over HTTP so hosted/remote agents can use SiteVigil too.
 
     Stateless request/response (one JSON-RPC message per POST), which is
-    enough for remote agents and curl. Binds to localhost by default:
-    the tools audit arbitrary URLs, so exposing this on a network
-    interface means running an unauthenticated audit service -- the
-    CLI prints a warning when asked to do that.
+    enough for remote agents and curl. Localhost-only by default (H2):
+    a non-loopback bind is refused unless allow_remote is set, and
+    then a bearer token is required and checked on every POST.
     """
-    _make_http_server(host, port).serve_forever()
+    if host not in _LOOPBACK_HOSTS and not allow_remote:
+        raise ValueError(
+            f"refusing to bind MCP server to non-loopback host {host!r} "
+            "without allow_remote")
+    if host not in _LOOPBACK_HOSTS and not token:
+        raise ValueError(
+            "allow_remote requires a bearer token (SITEVIGIL_MCP_TOKEN)")
+    _make_http_server(host, port, token=token).serve_forever()
 
 
 def serve(stdin=None, stdout=None) -> None:
@@ -156,7 +181,20 @@ def serve(stdin=None, stdout=None) -> None:
             msg = json.loads(line)
         except json.JSONDecodeError:
             continue
-        result = handle(msg)
+        if not isinstance(msg, dict):
+            continue
+        try:
+            result = handle(msg)
+        except Exception as e:
+            # M2: one bad call (a crashing audit, a malformed message)
+            # must not kill the server -- answer a JSON-RPC internal
+            # error and keep reading, like serve_http does.
+            if "id" in msg:
+                stdout.write(json.dumps({"jsonrpc": "2.0", "id": msg["id"],
+                                         "error": {"code": -32603,
+                                                   "message": f"internal error: {e}"}}) + "\n")
+                stdout.flush()
+            continue
         if result is not None and "id" in msg:
             stdout.write(json.dumps({"jsonrpc": "2.0", "id": msg["id"],
                                      "result": result}) + "\n")

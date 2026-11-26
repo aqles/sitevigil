@@ -12,6 +12,7 @@ single-page apps often answer 200 with index.html for every path
 from __future__ import annotations
 
 import html
+import ipaddress
 import json
 import re
 import socket
@@ -132,6 +133,97 @@ class _NoRedirect(HTTPRedirectHandler):
         return None
 
 
+# --- SSRF guard (audit finding H1) ----------------------------------------
+# SiteVigil fetches arbitrary URLs by design, so a private / loopback /
+# cloud-metadata target must be refused by default: without this, an
+# MCP caller (or a public URL that redirects to an internal one) can
+# make the machine running SiteVigil probe its own network. The check
+# is best-effort on names that do not resolve locally (e.g. behind a
+# proxy that resolves for us): an unresolvable name is passed through
+# and the fetch itself will fail, rather than being blocked on a guess.
+# Pass allow_private=True only for local development / tests.
+_SSRF_CHECK_CACHE: dict[tuple[str, bool], bool] = {}
+
+
+def _is_non_public_ip(ip_str: str) -> bool:
+    """True when an address is not a globally routable public address."""
+    try:
+        return not ipaddress.ip_address(ip_str).is_global
+    except ValueError:
+        return False
+
+
+def _validate_public_host(host: str, allow_private: bool = False) -> None:
+    """Raise ValueError when `host` is, or resolves to, a non-public IP.
+
+    IP literals are checked directly; names are resolved once and every
+    returned address must be public (a mix of public and private
+    answers is still a refusal -- DNS rebinding). A name that cannot
+    be resolved here is allowed through: the fetch will fail on its
+    own, and a proxy may be the one doing the resolving. Likewise,
+    when an https_proxy applies to the host, the proxy resolves it
+    and the local DNS answer is not authoritative.
+    """
+    if allow_private or not host:
+        return
+    key = (host.lower(), allow_private)
+    if _SSRF_CHECK_CACHE.get(key):
+        return
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        if _is_non_public_ip(host):
+            raise ValueError(
+                f"refusing to audit non-public host {host!r}: private, "
+                "loopback, link-local and cloud-metadata addresses are "
+                "blocked by default (use --allow-private for local sites)")
+        _SSRF_CHECK_CACHE[key] = True
+        return
+    # Behind an HTTP proxy the target is resolved by the proxy, not
+    # here: a local DNS answer is not authoritative (some resolvers
+    # answer every name, e.g. *.invalid -> a benchmarking address),
+    # so a proxied name is passed through and the proxy's CONNECT
+    # verdict decides. IP literals are still checked above.
+    import os
+    proxy = os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY")
+    if proxy:
+        no_proxy = os.environ.get("no_proxy") or os.environ.get("NO_PROXY") or ""
+        if not _no_proxy_match(host, no_proxy):
+            return
+    try:
+        infos = socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
+    except (socket.gaierror, OSError):
+        return
+    for _family, _type, _proto, _canon, sockaddr in infos:
+        if _is_non_public_ip(sockaddr[0]):
+            raise ValueError(
+                f"refusing to audit non-public host {host!r}: it resolves "
+                f"to non-public address {sockaddr[0]} (use --allow-private "
+                "for local sites)")
+    _SSRF_CHECK_CACHE[key] = True
+
+
+class _SSRFCheckedRedirect(HTTPRedirectHandler):
+    """Follow redirects, but re-validate every hop's host (H1).
+
+    A public URL that 302s to an internal one must not slip past the
+    check on the first URL: the redirect target is validated before
+    urllib follows it, and a private target aborts the fetch with a
+    URLError instead of being fetched.
+    """
+    allow_private = False
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        try:
+            _validate_public_host(urlparse(newurl).hostname or "",
+                                  self.allow_private)
+        except ValueError as e:
+            raise URLError(str(e))
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def _read_body(resp) -> bytes:
     """Read up to MAX_BODY bytes; a truncated body reads as what
     actually arrived. Some servers answer an error page with a chunked
@@ -149,11 +241,25 @@ def _read_body(resp) -> bytes:
 
 def _fetch(url: str, timeout: float, headers: dict | None = None,
            follow: bool = True, method: str = "GET",
-           data: bytes | None = None):
-    """Return (status, headers-as-dict-of-lists, body-bytes, final_url)."""
+           data: bytes | None = None, allow_private: bool = False):
+    """Return (status, headers-as-dict-of-lists, body-bytes, final_url).
+
+    Refuses non-public hosts unless allow_private is set (H1); the
+    refusal surfaces as URLError so every caller that already handles
+    unreachable hosts treats it as unreachable, never as a crash.
+    """
+    try:
+        _validate_public_host(urlparse(url).hostname or "", allow_private)
+    except ValueError as e:
+        raise URLError(str(e))
     req = Request(url, headers={"User-Agent": USER_AGENT, **(headers or {})},
                   method=method, data=data)
-    opener = build_opener() if follow else build_opener(_NoRedirect)
+    if follow:
+        handler = _SSRFCheckedRedirect()
+        handler.allow_private = allow_private
+        opener = build_opener(handler)
+    else:
+        opener = build_opener(_NoRedirect)
     try:
         with opener.open(req, timeout=timeout) as resp:
             return resp.status, _group(resp.headers), _read_body(resp), resp.geturl()
@@ -174,13 +280,19 @@ def _first(headers: dict, name: str) -> str | None:
     return values[0] if values else None
 
 
-def _redirect_chain(url: str, timeout: float, max_hops: int = 10) -> list[str]:
-    """Follow redirects manually, returning every URL visited (start first)."""
+def _redirect_chain(url: str, timeout: float, max_hops: int = 10,
+                    allow_private: bool = False) -> list[str]:
+    """Follow redirects manually, returning every URL visited (start first).
+
+    Each hop's host is re-validated (H1): the chain stops before a
+    private hop instead of following it.
+    """
     chain = [url]
     current = url
     for _ in range(max_hops):
         try:
-            status, headers, _, _ = _fetch(current, timeout, follow=False)
+            status, headers, _, _ = _fetch(current, timeout, follow=False,
+                                           allow_private=allow_private)
         except (URLError, socket.timeout, OSError):
             break
         if status not in (301, 302, 303, 307, 308):
@@ -188,7 +300,12 @@ def _redirect_chain(url: str, timeout: float, max_hops: int = 10) -> list[str]:
         location = _first(headers, "location")
         if not location:
             break
-        current = urljoin(current, location)
+        nxt = urljoin(current, location)
+        try:
+            _validate_public_host(urlparse(nxt).hostname or "", allow_private)
+        except ValueError:
+            break
+        current = nxt
         chain.append(current)
     return chain
 
@@ -210,12 +327,18 @@ class _LinkParser(HTMLParser):
                 self.links.append(href)
 
 
-def discover_urls(start_url: str, timeout: float = 10.0, limit: int = 5) -> list[str]:
+def discover_urls(start_url: str, timeout: float = 10.0, limit: int = 5,
+                  allow_private: bool = False) -> list[str]:
     """Find pages to crawl: sitemap.xml first, homepage links as fallback.
 
     Same-origin HTML pages only, start URL first, capped at `limit`.
+    A non-public start host is refused (H1) and yields no pages.
     """
     url = start_url if "://" in start_url else f"https://{start_url}"
+    try:
+        _validate_public_host(urlparse(url).hostname or "", allow_private)
+    except ValueError:
+        return []
     origin = urlparse(url)
     base = f"{origin.scheme}://{origin.netloc}"
     found: list[str] = []
@@ -236,12 +359,14 @@ def discover_urls(start_url: str, timeout: float = 10.0, limit: int = 5) -> list
     push(url)
     # 1) Sitemap (one level of sitemap-index is enough in practice)
     try:
-        _, _, sm_body, _ = _fetch(base + "/sitemap.xml", timeout)
+        _, _, sm_body, _ = _fetch(base + "/sitemap.xml", timeout,
+                                 allow_private=allow_private)
         locs = re.findall(r"<loc>\s*([^<]+?)\s*</loc>",
                           sm_body.decode("utf-8", errors="ignore"))
         xml_children = [u for u in locs if u.endswith(".xml")]
         if xml_children:
-            _, _, child_body, _ = _fetch(xml_children[0], timeout)
+            _, _, child_body, _ = _fetch(xml_children[0], timeout,
+                                        allow_private=allow_private)
             locs = re.findall(r"<loc>\s*([^<]+?)\s*</loc>",
                               child_body.decode("utf-8", errors="ignore"))
         for u in locs:
@@ -251,7 +376,7 @@ def discover_urls(start_url: str, timeout: float = 10.0, limit: int = 5) -> list
     # 2) Homepage links, if the sitemap did not fill the budget
     if len(found) < limit:
         try:
-            _, _, body, final = _fetch(url, timeout)
+            _, _, body, final = _fetch(url, timeout, allow_private=allow_private)
             parser = _LinkParser()
             parser.feed(body.decode("utf-8", errors="ignore"))
             for href in parser.links:
@@ -356,12 +481,28 @@ class _PageParser(HTMLParser):
         if url and not url.startswith(("data:", "blob:", "#")):
             self.resources.append(
                 (tag, urljoin(self.base, url), bool(a.get("integrity"))))
+        # srcset (img / source): "url [descriptor], url [descriptor], ..."
+        # -- without this, HTTP candidates in a srcset escape both the
+        # mixed-content and the (script-only) SRI checks.
+        if tag in ("img", "source"):
+            for candidate in (a.get("srcset") or "").split(","):
+                parts = candidate.strip().split()
+                if not parts:
+                    continue
+                src_url = parts[0]
+                if src_url and not src_url.startswith(("data:", "blob:", "#")):
+                    self.resources.append(
+                        (tag, urljoin(self.base, src_url),
+                         bool(a.get("integrity"))))
 
 
 def audit(raw_url: str, timeout: float = 10.0, cve: bool = True,
           ports: bool = True, progress=None, kev: bool = True,
           probes: bool = True, pentest: str = "safe",
-          osint: bool = True) -> dict:
+          osint: bool = True, allow_private: bool = False) -> dict:
+    """Audit a site. Non-public hosts are refused by default (H1):
+    the report comes back unreachable with an error explaining why.
+    Pass allow_private=True only for local development / tests."""
     url = raw_url if "://" in raw_url else f"https://{raw_url}"
     parsed = urlparse(url)
     host = parsed.hostname or ""
@@ -381,7 +522,8 @@ def audit(raw_url: str, timeout: float = 10.0, cve: bool = True,
     # --- Reachability + main response -------------------------------------
     started = time.perf_counter()
     try:
-        status, headers, body, final_url = _fetch(url, timeout)
+        status, headers, body, final_url = _fetch(
+            url, timeout, allow_private=allow_private)
     except (URLError, socket.timeout, OSError) as e:
         return {"url": url, "reachable": False, "error": str(e),
                 "score": 0, "grade": "F", "findings": []}
@@ -400,7 +542,7 @@ def audit(raw_url: str, timeout: float = 10.0, cve: bool = True,
     step(1)
 
     # --- Redirect chain -----------------------------------------------------
-    chain = _redirect_chain(url, timeout)
+    chain = _redirect_chain(url, timeout, allow_private=allow_private)
     for a, b in zip(chain, chain[1:]):
         if urlparse(a).scheme == "https" and urlparse(b).scheme == "http":
             add("redirect-downgrade", "high", "Redirect chain downgrades HTTPS to HTTP",
@@ -423,7 +565,8 @@ def audit(raw_url: str, timeout: float = 10.0, cve: bool = True,
     final_host = urlparse(final_url).hostname or host
     if parsed.scheme == "https" or is_https:
         try:
-            s2, _, _, final2 = _fetch(f"http://{final_host}", timeout, follow=True)
+            s2, _, _, final2 = _fetch(f"http://{final_host}", timeout, follow=True,
+                                      allow_private=allow_private)
             if urlparse(final2).scheme != "https":
                 add("http-no-redirect", "high", "HTTP does not redirect to HTTPS",
                     f"http://{host} answered with scheme {urlparse(final2).scheme} (status {s2}).",
@@ -441,7 +584,8 @@ def audit(raw_url: str, timeout: float = 10.0, cve: bool = True,
     if is_https:
         final_parsed = urlparse(final_url)
         tls = _check_tls(final_parsed.hostname or host,
-                         final_parsed.port or 443, add, timeout=timeout)
+                         final_parsed.port or 443, add, timeout=timeout,
+                         allow_private=allow_private)
         if tls.get("protocol") in ("TLSv1", "TLSv1.1", "SSLv3", "SSLv2"):
             add("tls-weak-protocol", "high", "Server negotiated a deprecated TLS version",
                 f"Negotiated {tls['protocol']}; TLS 1.0/1.1 are deprecated (RFC 8996) "
@@ -550,7 +694,8 @@ def audit(raw_url: str, timeout: float = 10.0, cve: bool = True,
     # --- CORS reflection ---------------------------------------------------------
     evil = "https://evil.example"
     try:
-        _, cors_headers, _, _ = _fetch(url, timeout, headers={"Origin": evil})
+        _, cors_headers, _, _ = _fetch(url, timeout, headers={"Origin": evil},
+                                       allow_private=allow_private)
         acao = _first(cors_headers, "access-control-allow-origin")
         acac = (_first(cors_headers, "access-control-allow-credentials") or "").lower()
         if acao == evil or (acao == "*" and acac == "true"):
@@ -575,7 +720,8 @@ def audit(raw_url: str, timeout: float = 10.0, cve: bool = True,
     )
     for path, marker, label in exposed:
         try:
-            s3, _, body3, _ = _fetch(base + path, timeout)
+            s3, _, body3, _ = _fetch(base + path, timeout,
+                                     allow_private=allow_private)
             if s3 == 200 and marker(body3):
                 add(f"exposed{path}", "critical", f"Exposed {label} at {path}",
                     f"GET {path} returned 200 with content matching a real {label}.",
@@ -610,7 +756,8 @@ def audit(raw_url: str, timeout: float = 10.0, cve: bool = True,
     # --- TRACE method ---------------------------------------------------------
     try:
         s4, _, body4, _ = _fetch(final_url, timeout, method="TRACE",
-                                 headers={"X-SiteVigil-Probe": "1"})
+                                 headers={"X-SiteVigil-Probe": "1"},
+                                 allow_private=allow_private)
         if s4 == 200 and b"x-sitevigil-probe" in body4.lower():
             add("trace-enabled", "medium", "HTTP TRACE method is enabled",
                 "The server echoed a TRACE request back (Cross-Site Tracing risk).",
@@ -620,7 +767,8 @@ def audit(raw_url: str, timeout: float = 10.0, cve: bool = True,
 
     # --- security.txt (presence requires a Contact: line, anti soft-404) ------
     try:
-        s5, _, body5, _ = _fetch(base + "/.well-known/security.txt", timeout)
+        s5, _, body5, _ = _fetch(base + "/.well-known/security.txt", timeout,
+                                 allow_private=allow_private)
         if not (s5 == 200 and b"contact:" in body5.lower()):
             add("security-txt-missing", "info", "No security.txt",
                 "/.well-known/security.txt is absent or has no Contact: line.",
@@ -686,12 +834,14 @@ def audit(raw_url: str, timeout: float = 10.0, cve: bool = True,
     if ports:
         # TCP connects get the audit timeout, capped: a filtered port
         # must not burn the whole fetch budget four times over.
-        open_db_ports = _check_db_ports(host, add, timeout=min(timeout, 2.5))
+        open_db_ports = _check_db_ports(host, add, timeout=min(timeout, 2.5),
+                                        allow_private=allow_private)
     step(8)
 
     # --- Active probes (non-destructive input tests) ---------------------
     if probes:
-        _active_probes(final_url, timeout, add, pentest)
+        _active_probes(final_url, timeout, add, pentest,
+                       allow_private=allow_private)
     step(9)
 
     # --- OSINT: DNS, registration, CT subdomains, hosting IP -------------
@@ -801,13 +951,25 @@ def generate_fix(report: dict) -> dict:
                      "for every route, then re-run SiteVigil to confirm."}
 
 
+def _finding_key(f: dict) -> tuple:
+    """Baseline-diff key for a finding (L3).
+
+    Keyed by (id, title), not id alone: the same CVE can hit two
+    fingerprinted products, and the same cookie name can be set twice,
+    and those are distinct findings -- keying by id alone silently
+    dropped one of them from baseline diffs while the score counted
+    both. Finding ids themselves are unchanged.
+    """
+    return (f.get("id"), f.get("title"))
+
+
 def compare_reports(baseline: dict, current: dict) -> dict:
     """Diff two reports: which findings are new, which were resolved."""
-    base_ids = {f["id"] for f in baseline.get("findings", [])}
-    cur = {f["id"]: f for f in current.get("findings", [])}
+    base_keys = {_finding_key(f) for f in baseline.get("findings", [])}
+    cur = {_finding_key(f): f for f in current.get("findings", [])}
     return {
-        "new": [f for fid, f in cur.items() if fid not in base_ids],
-        "resolved": [fid for fid in base_ids if fid not in cur],
+        "new": [f for k, f in cur.items() if k not in base_keys],
+        "resolved": sorted({k[0] for k in base_keys if k not in cur}),
         "score_delta": current.get("score", 0) - baseline.get("score", 0),
         "baseline_score": baseline.get("score"),
         "current_score": current.get("score"),
@@ -830,13 +992,22 @@ def _no_proxy_match(host: str, no_proxy: str) -> bool:
     return False
 
 
-def _tls_connect(host: str, port: int, timeout: float = 10):
+def _tls_connect(host: str, port: int, timeout: float = 10,
+                 allow_private: bool = False):
     """TCP connection to host:port, honouring https_proxy (CONNECT) so the
     TLS check also works behind corporate proxies, where a direct socket
-    would hit the proxy and fail with WRONG_VERSION_NUMBER."""
+    would hit the proxy and fail with WRONG_VERSION_NUMBER.
+
+    The target host is SSRF-checked (H1) -- the proxy host itself is
+    not: a local proxy (127.0.0.1:8080) is the operator's own infra.
+    """
     import base64
     import os
 
+    try:
+        _validate_public_host(host, allow_private)
+    except ValueError as e:
+        raise OSError(str(e))
     proxy = os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY")
     no_proxy = os.environ.get("no_proxy") or os.environ.get("NO_PROXY") or ""
     if not proxy or _no_proxy_match(host, no_proxy):
@@ -850,16 +1021,26 @@ def _tls_connect(host: str, port: int, timeout: float = 10):
         auth = f"Proxy-Authorization: Basic {creds}\r\n"
     raw.sendall(f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n"
                 f"{auth}\r\n".encode())
+    # Cap the proxy's response (L1): a broken or malicious proxy must
+    # not be able to fill memory with an endless header block.
     response = b""
     while b"\r\n\r\n" not in response:
+        if len(response) > 65536:
+            raw.close()
+            raise OSError("proxy CONNECT response too large")
         chunk = raw.recv(4096)
         if not chunk:
             break
         response += chunk
-    if b" 200 " not in response.split(b"\r\n", 1)[0] and \
-            not response.startswith(b"HTTP/1.1 200"):
+    first_line = response.split(b"\r\n", 1)[0].decode("iso-8859-1", "ignore")
+    parts = first_line.split()
+    try:
+        status_code = int(parts[1])
+    except (IndexError, ValueError):
+        status_code = 0
+    if status_code != 200:
         raw.close()
-        raise OSError(f"proxy CONNECT failed: {response[:80]!r}")
+        raise OSError(f"proxy CONNECT failed: {first_line[:80]!r}")
     return raw
 
 
@@ -875,16 +1056,32 @@ def _doh(name: str, rtype: str, timeout: float = 5.0) -> list[str]:
     answer, and counting it as (say) an MX record once produced false
     'this domain receives mail' findings for plain website subdomains.
     """
+    from urllib.parse import quote
     from urllib.request import urlopen
 
     req = Request(
-        f"https://cloudflare-dns.com/dns-query?name={name}&type={rtype}",
+        f"https://cloudflare-dns.com/dns-query?name={quote(name, safe='')}"
+        f"&type={rtype}",
         headers={"accept": "application/dns-json", "User-Agent": USER_AGENT})
     with urlopen(req, timeout=timeout) as resp:
         data = json.loads(resp.read())
     want = _DNS_TYPES[rtype]
     return [str(a.get("data", "")) for a in data.get("Answer", [])
             if a.get("type") == want]
+
+
+def _parent_domains(domain: str) -> list[str]:
+    """`domain`, then each parent, down to the registrable domain.
+
+    a.b.example.com -> [a.b.example.com, b.example.com, example.com].
+    Mail and certificate records are often only published on the
+    parent, so checking the full subdomain alone produces false
+    "missing DMARC / CAA / RDAP" findings (L7). Public-suffix
+    awareness (e.g. example.co.uk) is out of scope: two labels is
+    the floor.
+    """
+    parts = domain.split(".")
+    return [".".join(parts[i:]) for i in range(len(parts) - 1)]
 
 
 def _check_domain(host: str, add, timeout: float = 5.0) -> None:
@@ -906,30 +1103,40 @@ def _check_domain(host: str, add, timeout: float = 5.0) -> None:
         pass
     domain = host[4:] if host.startswith("www.") else host
     try:
-        mx = _doh(domain, "MX", timeout=timeout)
-        if mx:
-            txt = _doh(domain, "TXT", timeout=timeout)
+        # The mail-receiving domain may be a parent of the audited
+        # host (a subdomain rarely has MX of its own): walk up until
+        # one has MX records, and judge SPF/DMARC on that domain.
+        mail_domain = None
+        for candidate in _parent_domains(domain):
+            if _doh(candidate, "MX", timeout=timeout):
+                mail_domain = candidate
+                break
+        if mail_domain:
+            txt = _doh(mail_domain, "TXT", timeout=timeout)
             if not any(t.strip('"').lower().startswith("v=spf1") for t in txt):
                 add("spf-missing", "low", "No SPF record for a mail-receiving domain",
-                    f"{domain} has MX records but no v=spf1 TXT record.",
+                    f"{mail_domain} has MX records but no v=spf1 TXT record.",
                     "Publish an SPF TXT record listing the services allowed to "
                     "send mail for your domain.")
-            dmarc = _doh(f"_dmarc.{domain}", "TXT", timeout=timeout)
+            dmarc = _doh(f"_dmarc.{mail_domain}", "TXT", timeout=timeout)
             dmarc_rec = next((t for t in dmarc if "v=dmarc1" in t.lower()), None)
             if not dmarc_rec:
                 add("dmarc-missing", "medium", "No DMARC record for a mail-receiving domain",
-                    f"{domain} receives mail (MX present) but _dmarc.{domain} "
+                    f"{mail_domain} receives mail (MX present) but _dmarc.{mail_domain} "
                     "has no DMARC policy; anyone can spoof mail from this domain.",
                     "Publish a DMARC TXT record at _dmarc (start with p=none to "
                     "monitor, then move to p=reject).")
             elif "p=none" in dmarc_rec.lower().replace(" ", ""):
                 add("dmarc-monitor-only", "info", "DMARC policy is monitor-only (p=none)",
-                    f"_dmarc.{domain} is set to p=none: spoofed mail is reported "
+                    f"_dmarc.{mail_domain} is set to p=none: spoofed mail is reported "
                     "but still delivered.",
                     "Once the DMARC reports look clean, step up to p=quarantine "
                     "and then p=reject so spoofed mail is actually blocked.")
-        caa = _doh(domain, "CAA", timeout=timeout)
-        if not caa:
+        # CAA is inherited from parents too: any candidate having CAA
+        # records means issuance is restricted.
+        caa_found = any(_doh(candidate, "CAA", timeout=timeout)
+                        for candidate in _parent_domains(domain))
+        if not caa_found:
             add("caa-missing", "info", "No CAA record",
                 f"{domain} has no CAA records; any CA may issue certificates for it.",
                 "Add CAA records naming only the CA(s) you actually use.")
@@ -953,14 +1160,52 @@ def _osint_cache_path(name: str) -> str:
     return os.path.join(cache_dir, "osint", name)
 
 
-def _osint_cache_read(name: str):
+def _atomic_write_json(path: str, data) -> None:
+    """Write JSON atomically (temp file + rename) with mode 0o600 (M3).
+
+    A half-written cache must never be read back as data, and a
+    cache on a shared machine should not be world-readable. Callers
+    keep their own try/except: a cache write failing is never fatal.
+    """
+    import os
+    import tempfile
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path),
+                               prefix=".sitevigil-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _osint_cache_read(name: str, expect=None):
+    """Read a cached OSINT payload, or None.
+
+    The cached shape is validated (M3): a corrupted or hand-edited
+    file whose JSON parses but is the wrong type is discarded, not
+    trusted -- callers used to crash on it (e.g. a list where a dict
+    was expected).
+    """
     import os
     import time
     path = _osint_cache_path(name)
     try:
         if os.path.exists(path) and time.time() - os.path.getmtime(path) < _OSINT_CACHE_TTL:
             with open(path, encoding="utf-8") as fh:
-                return json.load(fh)
+                data = json.load(fh)
+            if expect is not None and not isinstance(data, expect):
+                return None
+            return data
     except Exception:
         pass
     return None
@@ -970,9 +1215,7 @@ def _osint_cache_write(name: str, data) -> None:
     import os
     path = _osint_cache_path(name)
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(data, fh)
+        _atomic_write_json(path, data)
     except Exception:
         pass
 
@@ -994,7 +1237,7 @@ def _rdap_lookup(domain: str, timeout: float = 10.0) -> dict | None:
     scraping, no raw TCP port 43 which many egress proxies block).
     Returns {registrar, registered, expires, nameservers} or None."""
     key = f"rdap-{domain}.json"
-    cached = _osint_cache_read(key)
+    cached = _osint_cache_read(key, dict)
     if cached is not None:
         return cached
     try:
@@ -1002,6 +1245,8 @@ def _rdap_lookup(domain: str, timeout: float = 10.0) -> dict | None:
         if status != 200:
             return None
         data = json.loads(body)
+        if not isinstance(data, dict):
+            return None
     except Exception:
         return None
     registrar = None
@@ -1030,7 +1275,7 @@ def _ct_lookup(domain: str, timeout: float = 10.0) -> list[str] | None:
     no key). Returns a sorted, deduplicated list (capped at 50) or None
     when crt.sh is unreachable."""
     key = f"ct-{domain}.json"
-    cached = _osint_cache_read(key)
+    cached = _osint_cache_read(key, list)
     if cached is not None:
         return cached
     try:
@@ -1040,11 +1285,18 @@ def _ct_lookup(domain: str, timeout: float = 10.0) -> list[str] | None:
         if status != 200:
             return None
         data = json.loads(body)
+        if not isinstance(data, list):
+            return None
     except Exception:
         return None
     names: set[str] = set()
     for entry in data:
-        for raw in (entry.get("name_value") or "").split():
+        if not isinstance(entry, dict):
+            continue
+        raw_value = entry.get("name_value") or ""
+        if not isinstance(raw_value, str):
+            continue
+        for raw in raw_value.split():
             name = raw.strip().lower().lstrip("*.").rstrip(".")
             if name == domain or name.endswith("." + domain):
                 names.add(name)
@@ -1057,7 +1309,7 @@ def _geo_lookup(ip: str, timeout: float = 10.0) -> dict | None:
     """IP location/network via ipwho.is (free, no key, HTTPS).
     Returns {country, region, city, isp, org, asn} or None."""
     key = f"geo-{ip}.json"
-    cached = _osint_cache_read(key)
+    cached = _osint_cache_read(key, dict)
     if cached is not None:
         return cached
     try:
@@ -1065,6 +1317,8 @@ def _geo_lookup(ip: str, timeout: float = 10.0) -> dict | None:
         if status != 200:
             return None
         data = json.loads(body)
+        if not isinstance(data, dict):
+            return None
         if not data.get("success"):
             return None
     except Exception:
@@ -1079,22 +1333,28 @@ def _geo_lookup(ip: str, timeout: float = 10.0) -> dict | None:
 
 
 def _resolve_ip(host: str) -> str | None:
-    """First public IPv4 for a hostname, or None. Private, loopback and
-    benchmarking ranges are skipped: behind a proxy, local DNS can
-    answer with a non-public address, and geolocating that would be a
-    lie, not data."""
+    """First public IP for a hostname (IPv4 first, then IPv6), or None.
+
+    Private, loopback and benchmarking ranges are skipped: behind a
+    proxy, local DNS can answer with a non-public address, and
+    geolocating that would be a lie, not data. IPv6 was previously
+    ignored entirely, so IPv6-only hosts got no geo data at all.
+    """
     import ipaddress
+    v6: str | None = None
     try:
         for family, _, _, _, sockaddr in socket.getaddrinfo(
                 host, 443, proto=socket.IPPROTO_TCP):
-            if family != socket.AF_INET:
-                continue
             ip = sockaddr[0]
-            if ipaddress.ip_address(ip).is_global:
+            if not ipaddress.ip_address(ip).is_global:
+                continue
+            if family == socket.AF_INET:
                 return ip
+            if v6 is None:
+                v6 = ip
     except Exception:
         pass
-    return None
+    return v6
 
 
 def _run_concurrent(jobs: dict) -> dict:
@@ -1166,14 +1426,15 @@ def _check_osint(host: str, add, timeout: float = 10.0) -> dict:
         return dns if any(dns.values()) else None
 
     def _gather_whois():
-        whois_domain = domain
-        whois = _rdap_lookup(domain, timeout=timeout)
-        if not whois and "." in domain:
-            parent = domain.split(".", 1)[1]
-            whois = _rdap_lookup(parent, timeout=timeout)
+        # Subdomains have no RDAP record of their own: walk up the
+        # parent domains until one answers (L7 -- previously only one
+        # label was stripped, so a.b.example.com never reached
+        # example.com).
+        for candidate in _parent_domains(domain):
+            whois = _rdap_lookup(candidate, timeout=timeout)
             if whois:
-                whois_domain = parent
-        return (whois, whois_domain) if whois else None
+                return (whois, candidate)
+        return None
 
     def _gather_subs():
         subs = _ct_lookup(domain, timeout=max(timeout, 25))
@@ -1201,7 +1462,7 @@ def _check_osint(host: str, add, timeout: float = 10.0) -> dict:
             "records, stray CNAMEs) when hardening the domain.")
 
     # Domain registration (RDAP). Subdomains have no RDAP record of
-    # their own, so the gather step falls back to the parent domain once.
+    # their own, so the gather step walks up the parent domains.
     whois_pair = gathered.get("whois")
     whois, whois_domain = whois_pair if whois_pair else (None, domain)
     if whois:
@@ -1352,18 +1613,28 @@ def _fingerprints(headers: dict, body_text: str) -> list[dict]:
 
 
 def _vkey(version: str) -> list:
+    """Version -> comparable key. Each dot/dash-separated token is
+    split into alternating numeric/alpha runs (M4): the old key kept
+    only the leading digits and letters of a token, so "3b1" and
+    "3b2" (and "rc1" / "rc2") compared equal and CVE range checks
+    could match -- or miss -- the wrong versions."""
     parts = []
     for token in re.split(r"[.\-+_]", str(version).strip()):
-        m = re.match(r"(\d*)([a-zA-Z]*)", token)
-        parts.append((int(m.group(1)) if m.group(1) else 0, m.group(2)))
+        segs = []
+        for run in re.findall(r"\d+|[a-zA-Z]+", token):
+            if run.isdigit():
+                segs.append((0, int(run), ""))
+            else:
+                segs.append((1, 0, run.lower()))
+        parts.append(tuple(segs))
     return parts
 
 
 def _vcmp(a: str, b: str) -> int:
     ka, kb = _vkey(a), _vkey(b)
     n = max(len(ka), len(kb))
-    ka += [(0, "")] * (n - len(ka))
-    kb += [(0, "")] * (n - len(kb))
+    ka += [()] * (n - len(ka))
+    kb += [()] * (n - len(kb))
     return (ka > kb) - (ka < kb)
 
 
@@ -1447,7 +1718,17 @@ def _cve_lookup(product_key: str, version: str) -> list[dict] | None:
     try:
         if os.path.exists(path) and time.time() - os.path.getmtime(path) < 86400:
             with open(path, encoding="utf-8") as fh:
-                return json.load(fh)["cves"]
+                cached = json.load(fh)
+            # Validate the shape (M3): a corrupted cache whose JSON
+            # parses but is not {"cves": [...]} used to be returned
+            # as-is and crash the caller (hits[:10] on an int, then
+            # hit["id"] on a character).
+            if (isinstance(cached, dict)
+                    and isinstance(cached.get("cves"), list)
+                    and all(isinstance(c, dict)
+                            and isinstance(c.get("id"), str)
+                            for c in cached["cves"])):
+                return cached["cves"]
     except Exception:
         pass
     # NVD without an API key allows 5 requests per 30 s; space ours out.
@@ -1480,9 +1761,7 @@ def _cve_lookup(product_key: str, version: str) -> list[dict] | None:
                     "description": desc[:280]})
     out.sort(key=lambda hit: hit["cvss"] or 0, reverse=True)
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump({"cves": out}, fh)
+        _atomic_write_json(path, {"cves": out})
     except Exception:
         pass
     return out
@@ -1509,7 +1788,13 @@ def _kev_lookup() -> dict[str, str] | None:
     try:
         if os.path.exists(path) and time.time() - os.path.getmtime(path) < 86400:
             with open(path, encoding="utf-8") as fh:
-                return json.load(fh)["kev"]
+                cached = json.load(fh)
+            # Validate the shape (M3): {"kev": {cve_id: date, ...}}.
+            if (isinstance(cached, dict)
+                    and isinstance(cached.get("kev"), dict)
+                    and all(isinstance(k, str) and isinstance(v, str)
+                            for k, v in cached["kev"].items())):
+                return cached["kev"]
     except Exception:
         pass
     try:
@@ -1522,9 +1807,7 @@ def _kev_lookup() -> dict[str, str] | None:
     except Exception:
         return None
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump({"kev": out}, fh)
+        _atomic_write_json(path, {"kev": out})
     except Exception:
         pass
     return out
@@ -1554,7 +1837,7 @@ def _with_param(base: str, name: str, value: str) -> str:
 
 
 def _active_probes(base_url: str, timeout: float, add,
-                   pentest: str = "safe") -> None:
+                   pentest: str = "safe", allow_private: bool = False) -> None:
     """Input probes. Safe mode is non-destructive: reflected XSS, open
     redirect, SQL error messages, dangerous HTTP methods, plus the
     read-only SSTI canary and CRLF header check. Aggressive mode adds
@@ -1575,6 +1858,10 @@ def _active_probes(base_url: str, timeout: float, add,
     import time
     from urllib.parse import parse_qsl, quote, urlencode
 
+    def _fetch_checked(url: str, timeout: float, **kw):
+        """_fetch with this audit's SSRF setting (H1)."""
+        return _fetch(url, timeout, allow_private=allow_private, **kw)
+
     # Each probe is a unit returning (findings, extra): findings is a
     # list of (id, severity, title, detail, fix) tuples, extra carries
     # the state later units depend on (put_allowed, sqli_found). Units
@@ -1594,7 +1881,7 @@ def _active_probes(base_url: str, timeout: float, add,
         # Read-only: the Allow header is the evidence. No PUT is ever sent
         # in safe mode, so nothing is written to the target.
         try:
-            status, headers, _, _ = _fetch(base_url, timeout, method="OPTIONS",
+            status, headers, _, _ = _fetch_checked(base_url, timeout, method="OPTIONS",
                                            follow=False)
             allow = {m.strip() for m in (_first(headers, "allow") or "").split(",")}
             dangerous = sorted(m for m in ("PUT", "DELETE") if m in allow)
@@ -1628,7 +1915,7 @@ def _active_probes(base_url: str, timeout: float, add,
                               urljoin(base_url, "/" + quote(canary, safe="")),
                               _with_param(base_url, "q", canary)):
                 try:
-                    _, _, body, _ = _fetch(probe_url, timeout)
+                    _, _, body, _ = _fetch_checked(probe_url, timeout)
                 except Exception:
                     continue
                 text = body.decode("utf-8", errors="ignore")
@@ -1662,7 +1949,7 @@ def _active_probes(base_url: str, timeout: float, add,
             for name in _REDIRECT_PARAMS:
                 probe_url = _with_param(base_url, name, "https://example.com")
                 try:
-                    status, headers, _, _ = _fetch(probe_url, timeout, follow=False)
+                    status, headers, _, _ = _fetch_checked(probe_url, timeout, follow=False)
                 except Exception:
                     continue
                 if status not in (301, 302, 303, 307, 308):
@@ -1700,7 +1987,7 @@ def _active_probes(base_url: str, timeout: float, add,
                 probe_url = p._replace(query=urlencode(q)).geturl()
             else:
                 probe_url = _with_param(base_url, "svsql", "1'")
-            _, _, body, _ = _fetch(probe_url, timeout)
+            _, _, body, _ = _fetch_checked(probe_url, timeout)
             text = body.decode("utf-8", errors="ignore").lower()
             hit = next((s for s in _SQL_ERRORS if s in text), None)
             if hit:
@@ -1732,7 +2019,7 @@ def _active_probes(base_url: str, timeout: float, add,
         # the signal; a merely reflected payload never contains it.
         try:
             for payload in ("{{1337*1337}}", "${1337*1337}"):
-                _, _, body, _ = _fetch(
+                _, _, body, _ = _fetch_checked(
                     _with_param(base_url, "svssti", payload), timeout)
                 text = body.decode("utf-8", errors="ignore")
                 if "1787569" in text:
@@ -1764,7 +2051,7 @@ def _active_probes(base_url: str, timeout: float, add,
         try:
             sep = "&" if "?" in base_url else "?"
             probe_url = base_url + sep + "svcrlf=%0d%0aX-SiteVigil-Probe:1"
-            _, headers, _, _ = _fetch(probe_url, timeout, follow=False)
+            _, headers, _, _ = _fetch_checked(probe_url, timeout, follow=False)
             if any(k.lower() == "x-sitevigil-probe" for k in headers):
                 add("crlf-injection", "medium",
                     "CRLF injection reaches response headers",
@@ -1817,7 +2104,7 @@ def _active_probes(base_url: str, timeout: float, add,
                     first = "svsql"
                     base_q[first] = "1"
                 t0 = time.perf_counter()
-                _fetch(_with_param(base_url, first, base_q[first]), timeout)
+                _fetch_checked(_with_param(base_url, first, base_q[first]), timeout)
                 baseline = time.perf_counter() - t0
                 for label, payload in (
                         ("SLEEP(5)", base_q[first] + "' AND SLEEP(5)-- "),
@@ -1825,7 +2112,7 @@ def _active_probes(base_url: str, timeout: float, add,
                         ("WAITFOR DELAY",
                          base_q[first] + "'; WAITFOR DELAY '0:0:5'-- ")):
                     t0 = time.perf_counter()
-                    _fetch(_with_param(base_url, first, payload), timeout)
+                    _fetch_checked(_with_param(base_url, first, payload), timeout)
                     took = time.perf_counter() - t0
                     if took >= 4.0 and took >= baseline * 3:
                         add("sqli-blind", "high",
@@ -1855,11 +2142,11 @@ def _active_probes(base_url: str, timeout: float, add,
         # different injection points.
         try:
             t0 = time.perf_counter()
-            _fetch(_with_param(base_url, "svcmdi", "1"), timeout)
+            _fetch_checked(_with_param(base_url, "svcmdi", "1"), timeout)
             baseline = time.perf_counter() - t0
             for payload in ("1; sleep 5", "1$(sleep 5)"):
                 t0 = time.perf_counter()
-                _fetch(_with_param(base_url, "svcmdi", payload), timeout)
+                _fetch_checked(_with_param(base_url, "svcmdi", payload), timeout)
                 took = time.perf_counter() - t0
                 if took >= 4.0 and took >= baseline * 3:
                     add("cmdi-sleep", "high",
@@ -1899,7 +2186,7 @@ def _active_probes(base_url: str, timeout: float, add,
                 true_val, false_val = "1 AND 1=1", "1 AND 1=2"
             lens = []
             for val in (true_val, false_val, true_val, false_val):
-                _, _, body, _ = _fetch(_with_param(base_url, first, val), timeout)
+                _, _, body, _ = _fetch_checked(_with_param(base_url, first, val), timeout)
                 lens.append(len(body))
             t1, f1, t2, f2 = lens
             if (abs(t1 - f1) > 100 and abs(t2 - f2) > 100
@@ -1937,7 +2224,7 @@ def _active_probes(base_url: str, timeout: float, add,
                 hit = False
                 for payload in ("../../../../etc/passwd",
                                 "....//....//....//etc/passwd"):
-                    _, _, body, _ = _fetch(
+                    _, _, body, _ = _fetch_checked(
                         _with_param(base_url, name, payload), timeout)
                     text = body.decode("utf-8", errors="ignore")
                     if "root:x:0:0" in text or "[boot loader]" in text:
@@ -1986,14 +2273,14 @@ def _active_probes(base_url: str, timeout: float, add,
             name = f"sv-{secrets.token_hex(4)}.txt"
             target = urljoin(base_url, "/" + name)
             body = b"sitevigil probe - delete me"
-            status, _, _, _ = _fetch(
+            status, _, _, _ = _fetch_checked(
                 target, timeout,
                 headers={"Content-Type": "text/plain"},
                 method="PUT", data=body)
             if status in (200, 201, 204):
-                _, _, got, _ = _fetch(target, timeout)
+                _, _, got, _ = _fetch_checked(target, timeout)
                 confirmed = got == body
-                del_status, _, _, _ = _fetch(target, timeout, method="DELETE",
+                del_status, _, _, _ = _fetch_checked(target, timeout, method="DELETE",
                                              follow=False)
                 cleaned = del_status in (200, 202, 204, 404)
                 detail = (f"PUT to {target} answered {status} and the file "
@@ -2016,7 +2303,8 @@ def _active_probes(base_url: str, timeout: float, add,
             pass
 
 
-def _check_db_ports(host: str, add, timeout: float = 2.5) -> list[int]:
+def _check_db_ports(host: str, add, timeout: float = 2.5,
+                    allow_private: bool = False) -> list[int]:
     """TCP-connect to well-known database ports; an open one is a finding.
 
     A plain connect only -- no banner grab, no login attempt. A refused or
@@ -2032,10 +2320,17 @@ def _check_db_ports(host: str, add, timeout: float = 2.5) -> list[int]:
     The four connects run concurrently: the sweep costs max(port)
     instead of sum(port). On a network where filtered ports burn the
     full timeout each, that is ~2.5 s instead of ~10 s.
+
+    Non-public hosts are not probed at all (H1).
     """
+    try:
+        _validate_public_host(host, allow_private)
+    except ValueError:
+        return []
     def _probe(port: int) -> bool:
         try:
-            sock = _tls_connect(host, port, timeout=timeout)
+            sock = _tls_connect(host, port, timeout=timeout,
+                                allow_private=allow_private)
             sock.close()
             return True
         except Exception:
@@ -2060,7 +2355,8 @@ def _check_db_ports(host: str, add, timeout: float = 2.5) -> list[int]:
     return open_ports
 
 
-def _check_tls(host: str, port: int, add, timeout: float = 10.0) -> dict:
+def _check_tls(host: str, port: int, add, timeout: float = 10.0,
+               allow_private: bool = False) -> dict:
     info: dict = {}
     try:
         # Verified handshake first: getpeercert() only returns the parsed
@@ -2068,7 +2364,8 @@ def _check_tls(host: str, port: int, add, timeout: float = 10.0) -> dict:
         try:
             ctx = ssl.create_default_context()
             ctx.set_alpn_protocols(["h2", "http/1.1"])
-            with _tls_connect(host, port, timeout=timeout) as sock:
+            with _tls_connect(host, port, timeout=timeout,
+                              allow_private=allow_private) as sock:
                 with ctx.wrap_socket(sock, server_hostname=host) as tls_sock:
                     cert = tls_sock.getpeercert()
                     info["protocol"] = tls_sock.version()
@@ -2076,7 +2373,8 @@ def _check_tls(host: str, port: int, add, timeout: float = 10.0) -> dict:
         except ssl.SSLCertVerificationError:
             ctx = ssl._create_unverified_context()
             ctx.set_alpn_protocols(["h2", "http/1.1"])
-            with _tls_connect(host, port, timeout=timeout) as sock:
+            with _tls_connect(host, port, timeout=timeout,
+                              allow_private=allow_private) as sock:
                 with ctx.wrap_socket(sock, server_hostname=host) as tls_sock:
                     info["protocol"] = tls_sock.version()
                     info["alpn"] = tls_sock.selected_alpn_protocol()
@@ -2089,18 +2387,32 @@ def _check_tls(host: str, port: int, add, timeout: float = 10.0) -> dict:
             raise
         not_after = cert.get("notAfter")
         if not_after:
-            expiry = datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z").replace(
-                tzinfo=timezone.utc)
-            days = (expiry - datetime.now(timezone.utc)).days
-            info["expires_in_days"] = days
-            if days < 0:
-                add("tls-expired", "critical", "TLS certificate has expired",
-                    f"Certificate expired {-days} day(s) ago ({not_after}).",
-                    "Renew the certificate immediately.")
-            elif days < 14:
-                add("tls-expiring", "high", "TLS certificate expires soon",
-                    f"Certificate expires in {days} day(s) ({not_after}).",
-                    "Renew the certificate and check your auto-renewal is working.")
+            # M1: an unparsable notAfter used to raise ValueError out
+            # of this function and kill the whole audit. Treat it as
+            # an unknown expiry instead and keep auditing.
+            try:
+                expiry = datetime.strptime(
+                    not_after, "%b %d %H:%M:%S %Y %Z").replace(
+                        tzinfo=timezone.utc)
+            except ValueError:
+                add("tls-error", "high",
+                    "TLS certificate expiry could not be parsed",
+                    f"Certificate notAfter value {not_after!r} is not in "
+                    "the expected format, so the expiry date is unknown.",
+                    "Check the certificate chain and renew the "
+                    "certificate if it is expired.")
+                expiry = None
+            if expiry is not None:
+                days = (expiry - datetime.now(timezone.utc)).days
+                info["expires_in_days"] = days
+                if days < 0:
+                    add("tls-expired", "critical", "TLS certificate has expired",
+                        f"Certificate expired {-days} day(s) ago ({not_after}).",
+                        "Renew the certificate immediately.")
+                elif days < 14:
+                    add("tls-expiring", "high", "TLS certificate expires soon",
+                        f"Certificate expires in {days} day(s) ({not_after}).",
+                        "Renew the certificate and check your auto-renewal is working.")
     except (ssl.SSLError, socket.timeout, OSError) as e:
         add("tls-error", "high", "TLS connection problem",
             str(e), "Check the certificate chain, hostname match and TLS configuration.")
@@ -2108,7 +2420,13 @@ def _check_tls(host: str, port: int, add, timeout: float = 10.0) -> dict:
 
 
 def _decode_der(der: bytes) -> dict:
-    """Parse a DER certificate with the stdlib's private test helper."""
+    """Parse a DER certificate with the stdlib's private test helper.
+
+    L6: `_ssl._test_decode_cert` is a private API and may disappear
+    in a future Python -- if it is gone (or the bytes are not a
+    certificate at all), return {} so the caller reports the expiry
+    as unknown instead of crashing.
+    """
     import os
     import tempfile
 
@@ -2116,7 +2434,12 @@ def _decode_der(der: bytes) -> dict:
         from ssl import _ssl
     except ImportError:
         return {}
-    fd, path = tempfile.mkstemp()
+    if not hasattr(_ssl, "_test_decode_cert"):
+        return {}
+    try:
+        fd, path = tempfile.mkstemp()
+    except OSError:
+        return {}
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(der)

@@ -112,7 +112,10 @@ sitevigil example.com --no-osint                    # skip the OSINT lookups (DN
 sitevigil example.com --pentest aggressive          # aggressive probes (blind SQLi incl. MSSQL, command-injection sleep, boolean blind SQLi, path traversal, PUT canary); authorized targets only
 sitevigil example.com --no-ports                    # skip the exposed-database-port check
 sitevigil example.com --html --output report.html   # write any format straight to a file
+sitevigil 127.0.0.1:8000 --allow-private         # audit a local dev site (private hosts are refused by default)
 ```
+
+**SSRF protection.** SiteVigil fetches arbitrary URLs by design, so private, loopback, link-local, and cloud-metadata hosts (including `169.254.169.254`) are refused by default — the report comes back unreachable with an error explaining why. Every redirect hop is re-validated, so a public URL that redirects to an internal one cannot slip through either. `--allow-private` turns this off for local development and tests; `audit_site` takes the same `allow_private` argument over MCP. Behind an `https_proxy`, the target is resolved by the proxy, so the local DNS answer is not authoritative and proxied names are passed through to the proxy's CONNECT verdict.
 
 Scoring starts at 100 and loses points per finding (critical 25, high 15, medium 8, low 3), ending in a grade from A to F.
 
@@ -127,6 +130,13 @@ sitevigil --mcp                      # stdio, for desktop/CLI agents
 sitevigil --mcp-http 8900            # HTTP on localhost, for hosted agents
 ```
 
+`--mcp-http` binds localhost only by default. To bind another interface, pass `--allow-remote` **and** set a bearer token — every `POST /mcp` must then carry `Authorization: Bearer $SITEVIGIL_MCP_TOKEN`:
+
+```bash
+SITEVIGIL_MCP_TOKEN="$(openssl rand -hex 32)" \
+  sitevigil --mcp-http 8900 --mcp-host 0.0.0.0 --allow-remote
+```
+
 MCP is a shared protocol, so **one server works with every MCP-compatible agent** — Claude Code, Claude Desktop, Cursor, Windsurf, VS Code, Gemini CLI — no per-agent builds. Only the config file's location changes; ready-to-paste snippets for each agent live in [examples/mcp](examples/mcp/README.md). Interoperability is not just claimed: the server is tested against the official MCP Python SDK client (initialize → tool list → a real `audit_site` call).
 
 Your agent gets two tools: `audit_site` (the full scored report) and `suggest_fix` (the audit plus a ready-to-commit, platform-specific header config). It can check a site before telling you it's "secure" — or audit the fix it just deployed.
@@ -137,6 +147,7 @@ Your agent gets two tools: `audit_site` (the full scored report) and `suggest_fi
 - The database-port check is a plain TCP connect to four well-known ports: no banner grabbing, no login attempts. A firewalled port counts as closed — the check claims reachability, nothing more.
 - Only audit sites you own or have permission to test. The probes are read-only `GET`s, but scanning other people's property without permission is still a bad idea.
 - A high score means these basics are in place. It is not a guarantee that a site is secure.
+- OSINT lookups (RDAP, Certificate Transparency, IP location) walk up to the parent domain when the audited host is a subdomain: mail and certificate records are usually only published on the parent, so checking the bare subdomain alone produced false "missing DMARC / CAA" findings. The hosting-IP lookup now also works for IPv6-only hosts (IPv4 first, then IPv6).
 
 ## Development
 
