@@ -4,6 +4,56 @@ SiteVigil versions its audit ruleset separately (shown in every report
 and via `sitevigil --checks`) so results stay comparable over time and
 changes to what is checked are never silent.
 
+## 0.17.0 — 2026-11-26 — ruleset 2026.11
+
+Breaking: private/loopback hosts are refused by default (use
+`--allow-private` for local dev); MCP over HTTP requires
+`--allow-remote` plus `SITEVIGIL_MCP_TOKEN` for non-loopback binds.
+
+- SSRF protection (audit H1). Non-public hosts -- private, loopback,
+  link-local, multicast, reserved, unspecified, including
+  `169.254.169.254` and `::1` -- are refused by default: the report
+  comes back unreachable with an error explaining why. The hostname
+  is resolved once and every returned address must be public; every
+  redirect hop is re-validated, and the TLS and database-port checks
+  refuse non-public hosts too. `--allow-private` (CLI) and
+  `allow_private` (`audit()` / MCP `audit_site`) opt out for local
+  development and tests. Behind an `https_proxy`, the target is
+  resolved by the proxy, so the local DNS answer is not authoritative
+  and proxied names are passed through to the proxy's CONNECT verdict.
+- MCP over HTTP is localhost-only by default (audit H2). A
+  non-loopback `--mcp-host` is refused unless `--allow-remote` is
+  passed *and* `SITEVIGIL_MCP_TOKEN` is set; the token is then
+  checked (constant-time) on every `POST /mcp`. The stdio server no
+  longer dies on one crashing call: it answers a JSON-RPC `-32603`
+  and keeps reading (audit M2).
+- Robustness (audit M1, M3, M4). An unparsable TLS `notAfter` is a
+  `tls-error` finding, not a crash that kills the whole audit. Cache
+  files (NVD, KEV, OSINT) are shape-validated on read -- a corrupted
+  cache is discarded and refetched -- and written atomically with
+  mode `0o600`. Version comparison parses full tokens, so `3b1` and
+  `3b2` (and `rc1` / `rc2`) no longer compare equal and CVE range
+  checks use the real version.
+- Small fixes (audit L1-L7). The proxy CONNECT response is capped at
+  64 KiB and its status code is parsed as an integer. DoH names are
+  URL-encoded. Baseline diffs key findings by `(id, title)`, so one
+  CVE hitting two products is two findings instead of one silently
+  dropped. `_PageParser` also collects `srcset` candidates for the
+  mixed-content check. The CLI rejects `--timeout <= 0`,
+  `--crawl < 0`, `--fail-under` outside 0-100, an invalid
+  `--mcp-http` port, an unreadable or empty `--baseline`, and an
+  `--output` directory that does not exist, with exit 2 instead of a
+  traceback. `_decode_der()` falls back to "expiry unknown" when the
+  private `ssl._ssl` helper is gone.
+- OSINT (stdlib only, free, no API key). RDAP, SPF/DMARC and CAA now
+  walk up parent domains instead of checking the bare subdomain
+  alone; the hosting-IP lookup works for IPv6-only hosts (IPv4
+  first, then IPv6); Certificate Transparency results are validated
+  before use.
+- Tests 33/33 (11 new: SSRF block, version comparison, unparsable
+  TLS expiry, MCP stdio crash guard, cache validation, parent-domain
+  walk-up, MCP HTTP token, CLI validation, srcset, IPv6 geo).
+
 ## 0.16.0 — ruleset 2026.11
 
 - Parallel audit phases (no new checks; catalog stays 58). Slow

@@ -69,7 +69,7 @@ Fair question — sites like SecurityHeaders or Mozilla Observatory grade a page
 | Known vulnerabilities | Software/version fingerprints (nginx, Apache, PHP, OpenSSL, IIS, WordPress, Drupal, Joomla) matched against NVD CVEs, verified against each CVE's vulnerable version ranges — plus jQuery and WordPress plugins (Elementor, WooCommerce, Contact Form 7, Akismet) fingerprinted from the page source. Every match is cross-checked against the CISA Known Exploited Vulnerabilities catalog and tagged `KNOWN EXPLOITED` when CISA lists it as exploited in the wild |
 | Info disclosure | `Server`, `X-Powered-By` |
 
-The full catalog — 30+ checks, each with its reference — is one command away: `sitevigil --checks`. Checks are versioned as a **ruleset** (currently `2026.11`); every report names the ruleset that produced it, and changes land in [CHANGELOG.md](CHANGELOG.md), never silently. To keep a site up to date automatically, drop in the weekly GitHub Action from [examples/github-action](examples/github-action/sitevigil-weekly.yml): it re-audits on a schedule and fails on score drops or regressions.
+The full catalog — 58 checks, each with its reference — is one command away: `sitevigil --checks`. Checks are versioned as a **ruleset** (currently `2026.11`); every report names the ruleset that produced it, and changes land in [CHANGELOG.md](CHANGELOG.md), never silently. To keep a site up to date automatically, drop in the weekly GitHub Action from [examples/github-action](examples/github-action/sitevigil-weekly.yml): it re-audits on a schedule and fails on score drops or regressions.
 
 Every finding includes what was actually observed and a concrete fix — not just a warning label.
 
@@ -112,7 +112,12 @@ sitevigil example.com --no-osint                    # skip the OSINT lookups (DN
 sitevigil example.com --pentest aggressive          # aggressive probes (blind SQLi incl. MSSQL, command-injection sleep, boolean blind SQLi, path traversal, PUT canary); authorized targets only
 sitevigil example.com --no-ports                    # skip the exposed-database-port check
 sitevigil example.com --html --output report.html   # write any format straight to a file
+sitevigil 127.0.0.1:8000 --allow-private         # audit a local dev site (private hosts are refused by default)
 ```
+
+**SSRF protection.** SiteVigil fetches arbitrary URLs by design, so private, loopback, link-local, and cloud-metadata hosts (including `169.254.169.254`) are refused by default — the report comes back unreachable with an error explaining why. Every redirect hop is re-validated, so a public URL that redirects to an internal one cannot slip through either. `--allow-private` turns this off for local development and tests; `audit_site` takes the same `allow_private` argument over MCP. Behind an `https_proxy`, the target is resolved by the proxy, so the local DNS answer is not authoritative and proxied names are passed through to the proxy's CONNECT verdict.
+
+**Upgrading to 0.17.0.** Two intentional breaking changes: audits of private/loopback hosts now need `--allow-private`, and a non-loopback `--mcp-http` bind now needs `--allow-remote` plus `SITEVIGIL_MCP_TOKEN` (see below). Everything else is a drop-in upgrade — see [CHANGELOG.md](CHANGELOG.md).
 
 Scoring starts at 100 and loses points per finding (critical 25, high 15, medium 8, low 3), ending in a grade from A to F.
 
@@ -125,6 +130,14 @@ SiteVigil ships an MCP server (still stdlib-only). Local agents use stdio; hoste
 ```bash
 sitevigil --mcp                      # stdio, for desktop/CLI agents
 sitevigil --mcp-http 8900            # HTTP on localhost, for hosted agents
+sitevigil --mcp-http 8900 --mcp-host 0.0.0.0 --allow-remote  # remote bind, requires SITEVIGIL_MCP_TOKEN
+```
+
+`--mcp-http` binds localhost only by default. To bind another interface, pass `--allow-remote` **and** set a bearer token — every `POST /mcp` must then carry `Authorization: Bearer $SITEVIGIL_MCP_TOKEN`:
+
+```bash
+SITEVIGIL_MCP_TOKEN="$(openssl rand -hex 32)" \
+  sitevigil --mcp-http 8900 --mcp-host 0.0.0.0 --allow-remote
 ```
 
 MCP is a shared protocol, so **one server works with every MCP-compatible agent** — Claude Code, Claude Desktop, Cursor, Windsurf, VS Code, Gemini CLI — no per-agent builds. Only the config file's location changes; ready-to-paste snippets for each agent live in [examples/mcp](examples/mcp/README.md). Interoperability is not just claimed: the server is tested against the official MCP Python SDK client (initialize → tool list → a real `audit_site` call).
@@ -137,6 +150,7 @@ Your agent gets two tools: `audit_site` (the full scored report) and `suggest_fi
 - The database-port check is a plain TCP connect to four well-known ports: no banner grabbing, no login attempts. A firewalled port counts as closed — the check claims reachability, nothing more.
 - Only audit sites you own or have permission to test. The probes are read-only `GET`s, but scanning other people's property without permission is still a bad idea.
 - A high score means these basics are in place. It is not a guarantee that a site is secure.
+- OSINT lookups (RDAP, Certificate Transparency, IP location) walk up to the parent domain when the audited host is a subdomain: mail and certificate records are usually only published on the parent, so checking the bare subdomain alone produced false "missing DMARC / CAA" findings. The hosting-IP lookup now also works for IPv6-only hosts (IPv4 first, then IPv6).
 
 ## Development
 

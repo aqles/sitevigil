@@ -80,6 +80,12 @@ def main(argv=None) -> int:
                              "(for hosted/remote agents)")
     parser.add_argument("--mcp-host", default="127.0.0.1",
                         help="Interface for --mcp-http (default: localhost only)")
+    parser.add_argument("--allow-remote", action="store_true",
+                        help="Allow --mcp-http to bind a non-loopback "
+                             "interface (requires SITEVIGIL_MCP_TOKEN)")
+    parser.add_argument("--allow-private", action="store_true",
+                        help="Allow auditing private/loopback hosts "
+                             "(local development only; SSRF protection off)")
     parser.add_argument("--timeout", type=float, default=10.0)
     parser.add_argument("--fix", action="store_true",
                         help="Also generate a ready-to-commit header config for the platform")
@@ -137,16 +143,60 @@ def main(argv=None) -> int:
         serve()
         return 0
     if args.mcp_http:
+        if not 1 <= args.mcp_http <= 65535:
+            parser.error("--mcp-http must be a port number between 1 and 65535")
         from .mcp_server import serve_http
+        token = os.environ.get("SITEVIGIL_MCP_TOKEN")
         if args.mcp_host not in ("127.0.0.1", "localhost", "::1"):
-            print(f"warning: binding {args.mcp_host} exposes an unauthenticated "
-                  "audit service (it fetches arbitrary URLs) to the network",
+            # H2: a non-loopback MCP server is an unauthenticated
+            # audit service on the network unless the operator
+            # explicitly allows it AND sets a bearer token.
+            if not args.allow_remote:
+                parser.error(
+                    f"--mcp-host {args.mcp_host} is not a loopback address: "
+                    "refusing to expose the MCP server; pass --allow-remote "
+                    "with SITEVIGIL_MCP_TOKEN set to allow it")
+            if not token:
+                parser.error(
+                    "--allow-remote requires the SITEVIGIL_MCP_TOKEN "
+                    "environment variable to be set")
+            print(f"warning: binding {args.mcp_host} exposes the MCP audit "
+                  "service to the network; requests require a bearer token",
                   file=sys.stderr)
         print(f"SiteVigil MCP server on http://{args.mcp_host}:{args.mcp_http}/mcp")
-        serve_http(args.mcp_http, host=args.mcp_host)
+        serve_http(args.mcp_http, host=args.mcp_host,
+                   allow_remote=args.allow_remote, token=token)
         return 0
     if not args.urls:
         parser.error("at least one url is required (or use --mcp / --checks)")
+
+    # L5: reject nonsense inputs up front with a friendly error
+    # (exit 2) instead of a traceback halfway through the run.
+    if args.timeout <= 0:
+        parser.error("--timeout must be greater than 0")
+    if args.crawl < 0:
+        parser.error("--crawl must be 0 or greater")
+    if args.fail_under is not None and not 0 <= args.fail_under <= 100:
+        parser.error("--fail-under must be between 0 and 100")
+
+    baseline_data = None
+    if args.baseline:
+        try:
+            with open(args.baseline, encoding="utf-8") as fh:
+                baseline_data = json.load(fh)
+        except (OSError, json.JSONDecodeError) as e:
+            parser.error(f"cannot read baseline file {args.baseline!r}: {e}")
+        if isinstance(baseline_data, list):
+            if not baseline_data:
+                parser.error(f"baseline file {args.baseline!r} is empty")
+            baseline_data = baseline_data[0]
+        if not isinstance(baseline_data, dict):
+            parser.error(
+                f"baseline file {args.baseline!r} is not a SiteVigil JSON report")
+    if args.output:
+        parent = Path(args.output).parent
+        if str(parent) and not parent.exists():
+            parser.error(f"output directory {str(parent)!r} does not exist")
 
     if args.pentest == "aggressive":
         print("warning: aggressive pentest mode sends write and time-delay "
@@ -158,7 +208,8 @@ def main(argv=None) -> int:
         if len(args.urls) != 1:
             parser.error("--crawl works with exactly one url")
         args.urls = discover_urls(args.urls[0], timeout=args.timeout,
-                                  limit=args.crawl)
+                                  limit=args.crawl,
+                                  allow_private=args.allow_private)
 
     # Colour and the live spinner only exist on a real terminal; pipes,
     # files, CI logs and machine formats get plain output by default.
@@ -180,7 +231,8 @@ def main(argv=None) -> int:
                              progress=progress, kev=not args.no_kev,
                              probes=not args.no_probes,
                              pentest=args.pentest,
-                             osint=not args.no_osint))
+                             osint=not args.no_osint,
+                             allow_private=args.allow_private))
         seen_hosts.add(host)
     if progress is not None:
         progress.finish()
@@ -189,11 +241,7 @@ def main(argv=None) -> int:
     if args.baseline:
         if len(reports) != 1:
             parser.error("--baseline works with exactly one url")
-        with open(args.baseline, encoding="utf-8") as fh:
-            base = json.load(fh)
-        if isinstance(base, list):
-            base = base[0]
-        comparison = compare_reports(base, reports[0])
+        comparison = compare_reports(baseline_data, reports[0])
 
     if args.output:
         args.no_banner = True  # files are records; the banner is terminal dress

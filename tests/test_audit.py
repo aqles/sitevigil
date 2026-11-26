@@ -18,9 +18,22 @@ from urllib.parse import parse_qs, urlsplit
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from sitevigil.audit import (  # noqa: E402
-    CHECKS, _PageParser, audit, compare_reports, discover_urls,
-    generate_fix, to_badge, to_html)
+    CHECKS, _PageParser, _decode_der, _parent_domains, _redirect_chain,
+    _validate_public_host, _vcmp, audit as _audit_impl, compare_reports,
+    discover_urls, generate_fix, to_badge, to_html)
 from sitevigil.mcp_server import handle  # noqa: E402
+
+
+def audit(*args, **kwargs):
+    """Test-suite wrapper around the real audit.
+
+    The fixture server is 127.0.0.1, which the SSRF guard refuses
+    by default -- so every audit of it opts in explicitly with
+    allow_private=True. The guard itself is tested separately below
+    against _audit_impl with the default (allow_private=False).
+    """
+    kwargs.setdefault("allow_private", True)
+    return _audit_impl(*args, **kwargs)
 
 INDEX = (b'<html><body>spa index <a href="/page2">two</a>'
          b'<script src="/assets/jquery-1.12.4.min.js"></script>'
@@ -364,7 +377,7 @@ class AuditTest(unittest.TestCase):
         ids = [f["id"] for f in report["findings"]]
         self.assertIn("redirect-chain-long", ids)
         self.assertEqual(len(report["redirect_chain"]), 5)
-        urls = discover_urls(self.base, limit=5)
+        urls = discover_urls(self.base, limit=5, allow_private=True)
         self.assertTrue(any(u.endswith("/page2") for u in urls), urls)
         self.assertTrue(any(u.endswith("/page3") for u in urls), urls)
         self.assertLessEqual(len(urls), 5)
@@ -407,7 +420,7 @@ class AuditTest(unittest.TestCase):
         from sitevigil.cli import main
         with tempfile.TemporaryDirectory() as td:
             out = Path(td) / "report.json"
-            self.assertEqual(main([self.base, "--json", "--output", str(out)]), 0)
+            self.assertEqual(main([self.base, "--json", "--output", str(out), "--allow-private"]), 0)
             saved = json.loads(out.read_text())
             self.assertIn("score", saved)
 
@@ -635,21 +648,21 @@ class AuditTest(unittest.TestCase):
         from sitevigil.cli import main
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            main([self.base])
+            main([self.base, "--allow-private"])
         self.assertIn("/ ____/", buf.getvalue())
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            main([self.base, "--no-banner"])
+            main([self.base, "--no-banner", "--allow-private"])
         self.assertNotIn("SITEVIGIL", buf.getvalue().split("Score")[0])
 
     def test_mcp_tools(self):
         names = [t["name"] for t in handle({"method": "tools/list"})["tools"]]
         self.assertEqual(names, ["audit_site", "suggest_fix"])
         out = handle({"method": "tools/call", "params": {
-            "name": "suggest_fix", "arguments": {"url": self.base}}})
+            "name": "suggest_fix", "arguments": {"url": self.base, "allow_private": True}}})
         self.assertIn("fix", json.loads(out["content"][0]["text"]))
         out = handle({"method": "tools/call", "params": {
-            "name": "audit_site", "arguments": {"url": self.base}}})
+            "name": "audit_site", "arguments": {"url": self.base, "allow_private": True}}})
         parsed = json.loads(out["content"][0]["text"])
         self.assertIn("score", parsed)
 
@@ -769,7 +782,7 @@ class AuditTest(unittest.TestCase):
         # 4. sitemap index: the .xml child is followed even when the
         # first <loc> is a plain page (the /sitemap.xml fixture is an
         # index now; test_v05 asserts /page2 and /page3 too)
-        urls = discover_urls(self.base, limit=5)
+        urls = discover_urls(self.base, limit=5, allow_private=True)
         self.assertTrue(any(u.endswith("/page3") for u in urls), urls)
 
         # 5. no_proxy: exact, suffix, wildcard, stripped, case-insensitive
@@ -817,7 +830,7 @@ class AuditTest(unittest.TestCase):
         # 7. --timeout reaches TLS, DB ports (capped at 2.5 s) and DoH
         seen_timeouts: list = []
 
-        def recording_tls_connect(host, port, timeout=10):
+        def recording_tls_connect(host, port, timeout=10, allow_private=False):
             seen_timeouts.append(timeout)
             raise OSError("down")
 
@@ -842,10 +855,10 @@ class AuditTest(unittest.TestCase):
         # 8. truncated chunked body (live crash against ednasalam.com):
         # _fetch returns the partial body instead of raising
         from sitevigil.audit import _fetch
-        status, _h, body, _u = _fetch(self.base + "/truncated", 5)
+        status, _h, body, _u = _fetch(self.base + "/truncated", 5, allow_private=True)
         self.assertEqual(status, 404)
         self.assertEqual(body, b"hello")
-        status, _h, body, _u = _fetch(self.base + "/truncated-ok", 5)
+        status, _h, body, _u = _fetch(self.base + "/truncated-ok", 5, allow_private=True)
         self.assertEqual(status, 200)
         self.assertEqual(body, b"hello")
 
@@ -1075,7 +1088,7 @@ class AuditTest(unittest.TestCase):
             def add3(fid, severity, title, detail, fix, extra=None):
                 seen3.append((fid, severity))
 
-            open_ports = _check_db_ports("127.0.0.1", add3, timeout=2.5)
+            open_ports = _check_db_ports("127.0.0.1", add3, timeout=2.5, allow_private=True)
         finally:
             audit_module.DB_PORTS = old_ports
             listener.close()
@@ -1096,6 +1109,292 @@ class AuditTest(unittest.TestCase):
 
         # catalog unchanged: parallelization adds no checks
         self.assertEqual(len(CHECKS), 58)
+
+
+    def test_v17_ssrf_block(self):
+        # H1: private / loopback / metadata literals are refused.
+        for host in ("127.0.0.1", "10.0.0.5", "192.168.1.1", "172.16.0.9",
+                     "169.254.169.254", "::1", "fe80::1"):
+            with self.assertRaises(ValueError, msg=host):
+                _validate_public_host(host)
+        # Public literals pass without any network access.
+        _validate_public_host("8.8.8.8")
+        _validate_public_host("1.1.1.1")
+        # The audit itself: blocked by default, unreachable with a
+        # clear error; the explicit opt-in audits the fixture.
+        blocked = _audit_impl(self.base)
+        self.assertFalse(blocked["reachable"])
+        self.assertIn("non-public", blocked["error"])
+        allowed = _audit_impl(self.base, allow_private=True)
+        self.assertTrue(allowed["reachable"])
+        # A redirect chain stops before a private hop.
+        self.assertEqual(_redirect_chain(self.base + "/hop1", 5),
+                         [self.base + "/hop1"])
+        self.assertEqual(len(_redirect_chain(self.base + "/hop1", 5,
+                                             allow_private=True)), 5)
+        # Crawl discovery and DB-port probes refuse private hosts too.
+        self.assertEqual(discover_urls(self.base, limit=5), [])
+        self.assertEqual(
+            discover_urls(self.base, limit=5, allow_private=True)[0],
+            self.base)
+        import sitevigil.audit as audit_module
+        self.assertEqual(
+            audit_module._check_db_ports("127.0.0.1", lambda *a: None),
+            [])
+
+    def test_v17_version_compare(self):
+        # M4: trailing digits inside a token count now.
+        self.assertLess(_vcmp("1.2.3b1", "1.2.3b2"), 0)
+        self.assertLess(_vcmp("1.0.0-rc1", "1.0.0-rc2"), 0)
+        self.assertLess(_vcmp("1.0.0-alpha.1", "1.0.0-alpha.2"), 0)
+        self.assertEqual(_vcmp("2.4.49", "2.4.49"), 0)
+        self.assertGreater(_vcmp("2.4.50", "2.4.49"), 0)
+        self.assertLess(_vcmp("1.2.3", "1.2.3.1"), 0)
+        self.assertGreater(_vcmp("1.10.0", "1.9.9"), 0)
+
+    def test_v17_tls_unparsable_expiry(self):
+        # M1: a certificate whose notAfter cannot be parsed must not
+        # kill the audit -- it becomes a tls-error finding.
+        import ssl as ssl_module
+        from unittest import mock
+
+        import sitevigil.audit as audit_module
+        tls_sock = mock.MagicMock()
+        tls_sock.version.return_value = "TLSv1.3"
+        tls_sock.selected_alpn_protocol.return_value = "h2"
+        tls_sock.getpeercert.return_value = {"notAfter": "not a date"}
+        tls_ctx = mock.MagicMock()
+        tls_ctx.wrap_socket.return_value.__enter__.return_value = tls_sock
+        raw_sock = mock.MagicMock()
+        raw_sock.__enter__.return_value = raw_sock
+
+        def fake_connect(host, port, timeout=10, allow_private=False):
+            return raw_sock
+
+        seen: list = []
+        with mock.patch.object(audit_module, "_tls_connect", fake_connect), \
+                mock.patch.object(ssl_module, "create_default_context",
+                                  return_value=tls_ctx):
+            info = audit_module._check_tls(
+                "example.com", 443, lambda *a: seen.append(a[0]), timeout=5)
+        self.assertEqual(seen, ["tls-error"])
+        self.assertNotIn("expires_in_days", info)
+        self.assertEqual(info.get("protocol"), "TLSv1.3")
+
+    def test_v17_mcp_stdio_crash_guard(self):
+        # M2: one crashing call must not kill the stdio server.
+        import io
+        from unittest import mock
+
+        from sitevigil import mcp_server
+        calls = {"n": 0}
+
+        def flaky(msg):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("boom")
+            return {"ok": True}
+
+        stdin = io.StringIO(
+            '{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}\n'
+            '{"jsonrpc": "2.0", "id": 2, "method": "ping"}\n')
+        stdout = io.StringIO()
+        with mock.patch.object(mcp_server, "handle", side_effect=flaky):
+            mcp_server.serve(stdin=stdin, stdout=stdout)
+        lines = [json.loads(line) for line in stdout.getvalue().splitlines()]
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(lines[0]["id"], 1)
+        self.assertEqual(lines[0]["error"]["code"], -32603)
+        self.assertEqual(lines[1]["id"], 2)
+        self.assertEqual(lines[1]["result"], {"ok": True})
+
+    def test_v17_cache_validation(self):
+        # M3: a cache file whose JSON parses but has the wrong shape
+        # is discarded and refetched, never trusted.
+        import os
+        import tempfile
+        from unittest import mock
+
+        import sitevigil.audit as audit_module
+        from sitevigil.audit import _osint_cache_read, _osint_cache_write
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(os.environ, {"SITEVIGIL_CACHE_DIR": td}):
+                # OSINT cache: a list where a dict is expected.
+                _osint_cache_write("rdap-example.com.json",
+                                   ["not", "a", "dict"])
+                self.assertIsNone(
+                    _osint_cache_read("rdap-example.com.json", dict))
+                _osint_cache_write("rdap-example.com.json",
+                                   {"registrar": "Example Registrar, Inc."})
+                self.assertEqual(
+                    _osint_cache_read("rdap-example.com.json", dict),
+                    {"registrar": "Example Registrar, Inc."})
+                # CVE cache: {"cves": 123} is ignored, NVD is re-queried.
+                cve_dir = os.path.join(td, "cve")
+                os.makedirs(cve_dir)
+                bad = os.path.join(cve_dir, "apache-http_server-2.4.49.json")
+                with open(bad, "w", encoding="utf-8") as fh:
+                    json.dump({"cves": 123}, fh)
+                with mock.patch.object(audit_module, "_nvd_query",
+                                       _canned_nvd):
+                    hits = audit_module._cve_lookup("apache", "2.4.49")
+                self.assertEqual([h["id"] for h in hits], ["CVE-2021-41773"])
+                with open(bad, encoding="utf-8") as fh:
+                    self.assertIsInstance(json.load(fh)["cves"], list)
+                # KEV cache: {"kev": "nope"} is ignored, feed re-fetched.
+                kev_path = os.path.join(td, "kev.json")
+                with open(kev_path, "w", encoding="utf-8") as fh:
+                    json.dump({"kev": "nope"}, fh)
+                feed = {"vulnerabilities": [
+                    {"cveID": "CVE-2021-41773", "dateAdded": "2021-11-03"}]}
+                resp = mock.MagicMock()
+                resp.read.return_value = json.dumps(feed).encode()
+                resp.__enter__.return_value = resp
+                with mock.patch("urllib.request.urlopen",
+                                return_value=resp):
+                    kev = audit_module._kev_lookup()
+                self.assertEqual(kev, {"CVE-2021-41773": "2021-11-03"})
+
+    def test_v17_parent_domains_and_compare(self):
+        # L7: parent-domain walk-up; L3: baseline diff keys by
+        # (id, title), so one CVE hitting two products is two findings.
+        self.assertEqual(_parent_domains("a.b.example.com"),
+                         ["a.b.example.com", "b.example.com", "example.com"])
+        self.assertEqual(_parent_domains("example.com"), ["example.com"])
+        base = {"findings": [{
+            "id": "cve-2021-41773", "severity": "high",
+            "title": "Apache HTTP Server 2.4.49 is affected by CVE-2021-41773",
+            "detail": "d", "fix": "f"}], "score": 85}
+        cur = {"findings": base["findings"] + [{
+            "id": "cve-2021-41773", "severity": "high",
+            "title": "nginx 1.18.0 is affected by CVE-2021-41773",
+            "detail": "d", "fix": "f"}], "score": 70}
+        diff = compare_reports(base, cur)
+        self.assertEqual(len(diff["new"]), 1)
+        self.assertIn("nginx", diff["new"][0]["title"])
+        self.assertEqual(diff["resolved"], [])
+
+    def test_v17_domain_walkup(self):
+        # L7: MX/DMARC/SPF are judged on the mail-receiving parent,
+        # not on the bare subdomain.
+        from unittest import mock
+
+        import sitevigil.audit as audit_module
+
+        def fake_doh(name, rtype, timeout=5.0):
+            if name == "example.com" and rtype == "MX":
+                return ["10 mail.example.com."]
+            if name == "sub.example.com" and rtype == "MX":
+                return []
+            if name == "_dmarc.example.com" and rtype == "TXT":
+                return ['"v=DMARC1; p=reject;"']
+            if name == "example.com" and rtype == "TXT":
+                return ['"v=spf1 -all"']
+            if rtype == "CAA":
+                return ['0 issue "letsencrypt.org"']
+            return []
+
+        seen: list = []
+        with mock.patch.object(audit_module, "_doh", fake_doh):
+            audit_module._check_domain(
+                "sub.example.com", lambda *a: seen.append(a[0]), timeout=5)
+        self.assertEqual(seen, [])
+
+        def fake_doh2(name, rtype, timeout=5.0):
+            if rtype == "MX":
+                return ["10 mail.example.com."] if name == "example.com" else []
+            return []
+
+        seen2: list = []
+        with mock.patch.object(audit_module, "_doh", fake_doh2):
+            audit_module._check_domain(
+                "a.b.example.com", lambda *a: seen2.append(a[0]), timeout=5)
+        self.assertIn("dmarc-missing", seen2)
+        self.assertIn("spf-missing", seen2)
+        self.assertIn("caa-missing", seen2)
+
+    def test_v17_mcp_http_token(self):
+        # H2: with a token configured, POST /mcp requires it.
+        import http.client
+        from sitevigil.mcp_server import _make_http_server, serve_http
+        server = _make_http_server("127.0.0.1", 0, token="secret")
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            conn = http.client.HTTPConnection(
+                "127.0.0.1", server.server_port, timeout=10)
+            body = json.dumps({"jsonrpc": "2.0", "id": 1,
+                               "method": "tools/list"}).encode()
+            conn.request("POST", "/mcp", body=body,
+                         headers={"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 401)
+            resp.read()
+            conn.request("POST", "/mcp", body=body,
+                         headers={"Content-Type": "application/json",
+                                  "Authorization": "Bearer secret"})
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 200)
+            payload = json.loads(resp.read())
+            self.assertEqual([t["name"] for t in payload["result"]["tools"]],
+                             ["audit_site", "suggest_fix"])
+            conn.request("POST", "/mcp", body=body,
+                         headers={"Content-Type": "application/json",
+                                  "Authorization": "Bearer wrong"})
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 401)
+            resp.read()
+            conn.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+        # serve_http refuses a non-loopback bind without --allow-remote,
+        # and without a token even with it.
+        with self.assertRaises(ValueError):
+            serve_http(0, host="0.0.0.0")
+        with self.assertRaises(ValueError):
+            serve_http(0, host="0.0.0.0", allow_remote=True)
+
+    def test_v17_cli_validation(self):
+        # L5: bad inputs fail with exit 2, not a traceback.
+        from sitevigil.cli import main
+        for argv in ([self.base, "--timeout", "-1"],
+                     [self.base, "--crawl", "-1"],
+                     [self.base, "--fail-under", "101"],
+                     [self.base, "--baseline", "/nonexistent-xyz/baseline.json"],
+                     [self.base, "--output", "/nonexistent-xyz-dir/report.json"],
+                     ["--mcp-http", "99999"],
+                     ["--mcp-http", "8900", "--mcp-host", "0.0.0.0"]):
+            with self.assertRaises(SystemExit) as cm:
+                main(argv)
+            self.assertEqual(cm.exception.code, 2, argv)
+
+    def test_v17_srcset_and_decode_der(self):
+        # L4: srcset candidates are collected; L6: garbage DER -> {}.
+        p = _PageParser("https://example.com/")
+        p.feed('<img src="https://example.com/a.png" '
+               'srcset="http://insecure.example/b.png 1x, https://example.com/c.png 2x">'
+               '<source srcset="http://insecure.example/d.mp4">')
+        urls = [u for _, u, _ in p.resources]
+        self.assertIn("http://insecure.example/b.png", urls)
+        self.assertIn("http://insecure.example/d.mp4", urls)
+        self.assertEqual(_decode_der(b"\x00\x01\x02"), {})
+        self.assertEqual(_decode_der(b""), {})
+
+    def test_v17_resolve_ip_v6(self):
+        # OSINT: an IPv6-only public host now resolves for geo; a
+        # private IPv4 answer is still skipped.
+        import socket as sock
+        from unittest import mock
+
+        import sitevigil.audit as audit_module
+        fake_info = [
+            (sock.AF_INET, sock.SOCK_STREAM, 6, "", ("192.168.1.1", 443)),
+            (sock.AF_INET6, sock.SOCK_STREAM, 6, "",
+             ("2606:4700:4700::1111", 443, 0, 0)),
+        ]
+        with mock.patch.object(sock, "getaddrinfo", return_value=fake_info):
+            self.assertEqual(audit_module._resolve_ip("example.com"),
+                             "2606:4700:4700::1111")
 
 
 if __name__ == "__main__":
