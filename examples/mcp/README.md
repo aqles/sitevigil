@@ -85,8 +85,8 @@ sitevigil --mcp-http 8900            # POST JSON-RPC to http://127.0.0.1:8900/mc
 ```
 
 The HTTP transport is stateless (one JSON-RPC message per POST,
-notifications get `202`), and it binds to **localhost only** unless you
-pass `--mcp-host`. Think before you do: the tools fetch arbitrary URLs
-and there is no authentication, so a network-exposed instance is an
-unauthenticated audit service. Put it behind your own authenticated
-reverse proxy if it must leave the machine.
+notifications get `202`), and it binds to **localhost only** by default.
+To bind another interface, pass `--allow-remote` **and** set
+`SITEVIGIL_MCP_TOKEN` — the token is checked on every `POST /mcp`
+(see the main README's MCP section). Without both, a non-loopback bind
+is refused.

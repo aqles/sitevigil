@@ -4,7 +4,11 @@ SiteVigil versions its audit ruleset separately (shown in every report
 and via `sitevigil --checks`) so results stay comparable over time and
 changes to what is checked are never silent.
 
-## Unreleased
+## 0.17.0 — 2026-11-26 — ruleset 2026.11
+
+Breaking: private/loopback hosts are refused by default (use
+`--allow-private` for local dev); MCP over HTTP requires
+`--allow-remote` plus `SITEVIGIL_MCP_TOKEN` for non-loopback binds.
 
 - SSRF protection (audit H1). Non-public hosts -- private, loopback,
   link-local, multicast, reserved, unspecified, including
