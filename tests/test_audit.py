@@ -13,14 +13,15 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from urllib.error import URLError
 from urllib.parse import parse_qs, urlsplit
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from sitevigil.audit import (  # noqa: E402
-    CHECKS, _PageParser, _decode_der, _parent_domains, _redirect_chain,
-    _validate_public_host, _vcmp, audit as _audit_impl, compare_reports,
-    discover_urls, generate_fix, to_badge, to_html)
+    CHECKS, _PageParser, _decode_der, _fetch, _parent_domains,
+    _redirect_chain, _validate_public_host, _vcmp, audit as _audit_impl,
+    compare_reports, discover_urls, generate_fix, to_badge, to_html)
 from sitevigil.mcp_server import handle  # noqa: E402
 
 
@@ -87,6 +88,15 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(302)
             self.send_header("Location", hops[self.path])
             self.end_headers()
+        elif self.path == "/bounce-308":
+            # 0.17.1 regression fixture: 308 to a path that 403s.
+            self.send_response(308)
+            self.send_header("Location", "/forbidden-403")
+            self.end_headers()
+        elif self.path == "/forbidden-403":
+            self.send_response(403)
+            self.end_headers()
+            self.wfile.write(b"forbidden")
         elif self.path == "/sitemap.xml":
             # sitemap INDEX: the first <loc> is a plain page, the child
             # sitemap comes second -- discover_urls must follow the .xml
@@ -1395,6 +1405,56 @@ class AuditTest(unittest.TestCase):
         with mock.patch.object(sock, "getaddrinfo", return_value=fake_info):
             self.assertEqual(audit_module._resolve_ip("example.com"),
                              "2606:4700:4700::1111")
+
+    def test_v171_fetch_error_reports_erroring_url(self):
+        # 0.17.1: an HTTPError raised on a redirect hop used to be
+        # reported with the ORIGINAL url as final_url, so an https
+        # hop's 403 masqueraded as "http did not redirect to HTTPS"
+        # (seen live when WebCheck scanned itself from Vercel: the
+        # chain proved the redirect happened, yet the probe reported
+        # scheme http, status 403).
+        status, _h, _b, final = _fetch(
+            self.base + "/bounce-308", 5, follow=True, allow_private=True)
+        self.assertEqual(status, 403)
+        self.assertEqual(final, self.base + "/forbidden-403")
+        self.assertEqual(_redirect_chain(self.base + "/bounce-308", 5,
+                                         allow_private=True),
+                         [self.base + "/bounce-308",
+                          self.base + "/forbidden-403"])
+
+    def test_v171_http_probe_trusts_redirect_chain(self):
+        # 0.17.1: the http->https probe trusts the redirect chain,
+        # not just the followed fetch's final URL.
+        import sitevigil.audit as audit_module
+        orig_fetch = audit_module._fetch
+        orig_chain = audit_module._redirect_chain
+        try:
+            # https hop answers 403: the redirect still happened.
+            audit_module._fetch = lambda *a, **k: (
+                403, {}, b"", "https://example.com/")
+            audit_module._redirect_chain = lambda *a, **k: [
+                "http://example.com/", "https://example.com/"]
+            self.assertEqual(
+                audit_module._http_redirects_to_https("example.com", 5)[0],
+                True)
+            # Same 403, but the chain never reaches https: no redirect.
+            audit_module._fetch = lambda *a, **k: (
+                403, {}, b"", "http://example.com/")
+            audit_module._redirect_chain = lambda *a, **k: [
+                "http://example.com/"]
+            self.assertEqual(
+                audit_module._http_redirects_to_https("example.com", 5),
+                (False, "http", 403))
+            # HTTP port closed: inconclusive, not a finding.
+            def _boom(*a, **k):
+                raise URLError("conn refused")
+            audit_module._fetch = _boom
+            self.assertEqual(
+                audit_module._http_redirects_to_https("example.com", 5),
+                (None, None, None))
+        finally:
+            audit_module._fetch = orig_fetch
+            audit_module._redirect_chain = orig_chain
 
 
 if __name__ == "__main__":

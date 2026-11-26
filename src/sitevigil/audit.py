@@ -264,7 +264,12 @@ def _fetch(url: str, timeout: float, headers: dict | None = None,
         with opener.open(req, timeout=timeout) as resp:
             return resp.status, _group(resp.headers), _read_body(resp), resp.geturl()
     except HTTPError as e:
-        return e.code, _group(e.headers), _read_body(e), url
+        # Report the URL that actually errored, not the one that was
+        # requested: after a redirect the two differ, and returning
+        # the original URL misattributes the error -- an https hop's
+        # 403 then masquerades as "http did not redirect to HTTPS"
+        # (seen live when WebCheck scanned itself from Vercel).
+        return e.code, _group(e.headers), _read_body(e), e.geturl() or url
 
 
 def _group(headers) -> dict:
@@ -308,6 +313,36 @@ def _redirect_chain(url: str, timeout: float, max_hops: int = 10,
         current = nxt
         chain.append(current)
     return chain
+
+
+def _http_redirects_to_https(host: str, timeout: float,
+                            allow_private: bool = False):
+    """Probe whether plain HTTP for `host` redirects to HTTPS.
+
+    Returns (True, "https", status) when the redirect works,
+    (False, scheme, status) when the final answer is not HTTPS, and
+    (None, None, None) when the probe could not run at all (HTTP port
+    closed / unreachable -- acceptable, not a finding).
+
+    The redirect chain is the authoritative record of the hops: an
+    error on the https hop must not masquerade as "no redirect", so
+    if any hop is https the redirect is counted as working even when
+    the followed fetch itself errored.
+    """
+    try:
+        status, _h, _b, final = _fetch(
+            f"http://{host}", timeout, follow=True,
+            allow_private=allow_private)
+    except (URLError, socket.timeout, OSError):
+        return None, None, None
+    scheme = urlparse(final).scheme
+    if scheme == "https":
+        return True, scheme, status
+    chain = _redirect_chain(f"http://{host}", timeout,
+                            allow_private=allow_private)
+    if any(urlparse(h).scheme == "https" for h in chain):
+        return True, "https", status
+    return False, scheme, status
 
 
 _SKIP_EXT = re.compile(
@@ -564,15 +599,12 @@ def audit(raw_url: str, timeout: float = 10.0, cve: bool = True,
     # says nothing about the site being audited.
     final_host = urlparse(final_url).hostname or host
     if parsed.scheme == "https" or is_https:
-        try:
-            s2, _, _, final2 = _fetch(f"http://{final_host}", timeout, follow=True,
-                                      allow_private=allow_private)
-            if urlparse(final2).scheme != "https":
-                add("http-no-redirect", "high", "HTTP does not redirect to HTTPS",
-                    f"http://{host} answered with scheme {urlparse(final2).scheme} (status {s2}).",
-                    "Redirect all HTTP traffic to HTTPS at the server or CDN level (301).")
-        except (URLError, socket.timeout, OSError):
-            pass  # HTTP port closed is acceptable
+        ok, scheme, s2 = _http_redirects_to_https(
+            final_host, timeout, allow_private=allow_private)
+        if ok is False:
+            add("http-no-redirect", "high", "HTTP does not redirect to HTTPS",
+                f"http://{host} answered with scheme {scheme} (status {s2}).",
+                "Redirect all HTTP traffic to HTTPS at the server or CDN level (301).")
 
     if not is_https:
         add("no-https", "critical", "Site is not served over HTTPS",
